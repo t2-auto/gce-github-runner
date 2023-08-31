@@ -193,6 +193,9 @@ function start_vm {
   echo "The new GCE VM will be ${VM_ID}"
 
   startup_script="
+	# Install NVIDIA driver if exists
+	[[ -x /opt/deeplearning/install-driver.sh ]] && /opt/deeplearning/install-driver.sh
+
 	# Create a systemd service in charge of shutting down the machine once the workflow has finished
 	cat <<-EOF > /etc/systemd/system/shutdown.sh
 	#!/bin/sh
