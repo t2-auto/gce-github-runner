@@ -96,6 +96,8 @@ inputs:
     required: false
   maintenance_policy_terminate:
     description: "Set Google maintenance policy to TERMINATE.  This is required for GPUs as they do ot support live-migration."
+  instance_termination_action_delete:
+    description: "Specifies DELETE action that will be taken upon VM preemption"
   boot_disk_type:
     description: "Boot disk type for the GCE instance (https://cloud.google.com/sdk/gcloud/reference/compute/disk-types/list)"
     required: false
@@ -134,5 +136,6 @@ runs:
         --no_external_address=${{ inputs.no_external_address }}
         --actions_preinstalled=${{ inputs.actions_preinstalled }}
         --maintenance_policy_terminate=${{ inputs.maintenance_policy_terminate }}
+        --instance_termination_action_delete=${{inputs.instance_termination_action_delete}}
         --arm=${{ inputs.arm }}
       shell: bash

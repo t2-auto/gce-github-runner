@@ -38,6 +38,7 @@ ephemeral=
 no_external_address=
 actions_preinstalled=
 maintenance_policy_terminate=
+instance_termination_action_delete=
 arm=
 accelerator=
 
@@ -66,6 +67,7 @@ while getopts_long :h opt \
   actions_preinstalled required_argument \
   arm required_argument \
   maintenance_policy_terminate optional_argument \
+  instance_termination_action_delete optional_argument \
   accelerator optional_argument \
   help no_argument "" "$@"
 do
@@ -136,6 +138,9 @@ do
     maintenance_policy_terminate)
       maintenance_policy_terminate=${OPTLARG-$maintenance_policy_terminate}
       ;;
+    instance_termination_action_delete)
+      instance_termination_action_delete=${OPTLARG-$instance_termination_action_delete}
+      ;;
     arm)
       arm=$OPTLARG
       ;;
@@ -189,6 +194,7 @@ function start_vm {
   subnet_flag=$([[ ! -z "${subnet}"  ]] && echo "--subnet=${subnet}" || echo "")
   accelerator=$([[ ! -z "${accelerator}"  ]] && echo "--accelerator=${accelerator} --maintenance-policy=TERMINATE" || echo "")
   maintenance_policy_flag=$([[ -z "${maintenance_policy_terminate}"  ]] || echo "--maintenance-policy=TERMINATE" )
+  instance_termination_action_flag=$([[ -z "${instance_termination_action_delete}"  ]] || echo "--instance-termination-action=DELETE" )
 
   echo "The new GCE VM will be ${VM_ID}"
 
@@ -305,6 +311,7 @@ function start_vm {
     ${subnet_flag} \
     ${accelerator} \
     ${maintenance_policy_flag} \
+    ${instance_termination_action_flag} \
     --labels=gh_ready=0,gh_repo_owner="${gh_repo_owner}",gh_repo="${gh_repo}",gh_run_id="${gh_run_id}" \
     --metadata=startup-script="$startup_script" \
     && echo "label=${VM_ID}" >> $GITHUB_OUTPUT
