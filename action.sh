@@ -305,7 +305,7 @@ function start_vm {
 	# Ensure actions.runner service is active
 	#   it will shutdown the instance if actions.runner is not active
 	#   the instance will be shutdown in 1 day if actions runner is active even though the max workflow runtime is 3 days
-	if systemctl show actions.runner*${VM_ID}* -p ActiveState | grep 'ActiveState=' | head -1 | cut -f 2 -d '=' | grep 'active'; then
+	if systemctl show actions.runner* -p ActiveState | grep 'ActiveState=' | head -1 | cut -f 2 -d '=' | grep 'active'; then
 	  echo \"✅ Successfully started the GitHub Actions runner service.\";
 	  gcloud compute instances add-labels ${VM_ID} --zone=${machine_zone} --labels=gh_ready=1;
 	  nohup sh -c \"sleep 1d && CLOUDSDK_CONFIG=/tmp gcloud --quiet compute instances delete ${VM_ID} --zone=${machine_zone}\" > /dev/null &
