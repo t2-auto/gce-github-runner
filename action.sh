@@ -296,13 +296,23 @@ function start_vm {
 
 	# See: https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/running-scripts-before-or-after-a-job
 	echo "ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/bin/gce_runner_shutdown.sh" >.env
+	
 	gcloud compute instances add-labels ${VM_ID} --zone=${machine_zone} --labels=gh_ready=0 && \\
 	RUNNER_ALLOW_RUNASROOT=1 ./config.sh --url https://github.com/${GITHUB_REPOSITORY} --token ${RUNNER_TOKEN} --labels ${VM_ID} --unattended ${ephemeral_flag} --disableupdate && \\
 	./svc.sh install && \\
-	./svc.sh start && \\
-	gcloud compute instances add-labels ${VM_ID} --zone=${machine_zone} --labels=gh_ready=1
-	# self shutdown in 1 day.
-	nohup sh -c \"sleep 1d && CLOUDSDK_CONFIG=/tmp gcloud --quiet compute instances delete ${VM_ID} --zone=${machine_zone}\" > /dev/null &
+	./svc.sh start
+
+	# Ensure actions.runner service is active
+	# if actions.runner is not active, it will shutdown the instance
+	if systemctl show actions.runner*${VM_ID}* -p ActiveState | grep 'ActiveState=' | head -1 | cut -f 2 -d '=' | grep 'active'; then
+	  echo "✅ Successfully started the GitHub Actions runner service."
+	  gcloud compute instances add-labels ${VM_ID} --zone=${machine_zone} --labels=gh_ready=1
+	  # self-shutdown in 1 day.
+	  nohup sh -c \"sleep 1d && CLOUDSDK_CONFIG=/tmp gcloud --quiet compute instances delete ${VM_ID} --zone=${machine_zone}\" > /dev/null &
+	else
+	  echo "❌ Failed to start the GitHub Actions runner service. Exiting ..."
+	  sh /usr/bin/gce_runner_shutdown.sh
+	fi
   "
 
   if $actions_preinstalled ; then
