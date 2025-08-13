@@ -293,10 +293,20 @@ function start_vm {
 	# We tear down the machine by starting the systemd service that was registered by the startup script
 	systemctl start shutdown.service
 	EOF
+	chmod +x /usr/bin/gce_runner_shutdown.sh
+
+	cat <<-EOF > /usr/bin/gce_runner_job_started.sh
+	#!/bin/sh
+	set -x
+	mkdir -p /tmp
+	touch /tmp/gce_runner_job_started
+	EOF
+	chmod +x /usr/bin/gce_runner_job_started.sh
 
 	# See: https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/running-scripts-before-or-after-a-job
 	echo \"ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/bin/gce_runner_shutdown.sh\" >.env
-	
+	echo \"ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/bin/gce_runner_job_started.sh\" >>.env
+
 	gcloud compute instances add-labels ${VM_ID} --zone=${machine_zone} --labels=gh_ready=0 && \\
 	RUNNER_ALLOW_RUNASROOT=1 ./config.sh --url https://github.com/${GITHUB_REPOSITORY} --token ${RUNNER_TOKEN} --labels ${VM_ID} --unattended ${ephemeral_flag} --disableupdate && \\
 	./svc.sh install && \\
@@ -304,11 +314,13 @@ function start_vm {
 
 	# Ensure actions.runner service is active
 	#   it will shutdown the instance if actions.runner is not active
+	#   the instance will be shutdown when no job has been started in 1 hour
 	#   the instance will be shutdown in 1 day if actions runner is active even though the max workflow runtime is 3 days
 	if systemctl show actions.runner* -p ActiveState | grep 'ActiveState=' | head -1 | cut -f 2 -d '=' | grep 'active'; then
 	  echo \"✅ Successfully started the GitHub Actions runner service.\";
 	  gcloud compute instances add-labels ${VM_ID} --zone=${machine_zone} --labels=gh_ready=1;
-	  nohup sh -c \"sleep 1d && CLOUDSDK_CONFIG=/tmp gcloud --quiet compute instances delete ${VM_ID} --zone=${machine_zone}\" > /dev/null &
+	  nohup sh -c \"sleep 1h && ([ -f  /tmp/gce_runner_job_started ] || systemctl start shutdown.service)\" > /dev/null &
+	  nohup sh -c \"sleep 3d && systemctl start shutdown.service\" > /dev/null &
 	else
 	  echo \"❌ Failed to start the GitHub Actions runner service. Exiting ...\";
 	  sh /usr/bin/gce_runner_shutdown.sh;
