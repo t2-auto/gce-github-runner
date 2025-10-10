@@ -151,3 +151,11 @@ runs:
         --instance_termination_action_delete=${{inputs.instance_termination_action_delete}}
         --arm=${{ inputs.arm }}
       shell: bash
+
+    - id: debug
+      continue-on-error: true
+      if: always()
+      run: |
+        echo "GCE GitHub Runner action outcome: ${{ steps.gce-github-runner-script.outcome }}"
+        echo "GCE GitHub Runner action conclusion: ${{ steps.gce-github-runner-script.conclusion }}"
+      shell: bash
