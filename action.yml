@@ -111,12 +111,12 @@ outputs:
       Unique runner label. This label can be used to request a specific
       runner for the workflow job.
     value: ${{ steps.gce-github-runner-script.outputs.label }}
-  outcome:
+  internal_outcome:
     description: Outcome of the internal gce-github-runner-script action
-    value: ${{ steps.gce-github-runner-script.outputs.outcome }}
-  conclusion:
+    value: ${{ steps.output.outputs.internal_outcome }}
+  internal_conclusion:
     description: Conclusion of the internal gce-github-runner-script action
-    value: ${{ steps.gce-github-runner-script.outputs.conclusion }}
+    value: ${{ steps.output.outputs.internal_conclusion }}
 
 runs:
   using: "composite"
@@ -152,10 +152,12 @@ runs:
         --arm=${{ inputs.arm }}
       shell: bash
 
-    - id: debug
+    - id: output
       continue-on-error: true
       if: always()
       run: |
         echo "GCE GitHub Runner action outcome: ${{ steps.gce-github-runner-script.outcome }}"
         echo "GCE GitHub Runner action conclusion: ${{ steps.gce-github-runner-script.conclusion }}"
+        echo "internal_outcome=${{ steps.gce-github-runner-script.outcome }}" >> $GITHUB_OUTPUT
+        echo "internal_conclusion=${{ steps.gce-github-runner-script.conclusion }}" >> $GITHUB_OUTPUT
       shell: bash
