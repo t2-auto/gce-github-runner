@@ -376,8 +376,9 @@ function start_vm {
     ${instance_termination_action_flag} \
     --labels=gh_ready=0,gh_repo_owner="${gh_repo_owner}",gh_repo="${gh_repo}",gh_run_id="${gh_run_id}",gh_run_attempt="${gh_run_attempt}",gh_job="${gh_job}" \
     --metadata-from-file=shutdown-script=/tmp/shutdown_script.sh \
-    --metadata=startup-script="$startup_script" \
-    && echo "label=${VM_ID}" >> $GITHUB_OUTPUT
+    --metadata=startup-script="$startup_script"
+
+  echo "label=${VM_ID}" >> $GITHUB_OUTPUT
 
   safety_off
   while (( i++ < 60 )); do
