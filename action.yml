@@ -104,7 +104,9 @@ inputs:
   fallback_runs_on_enabled:
     description: "Whether to enable fallback to self-hosted runner. If this is set to true, the job will not fail even if the GCE runner fails to start."
     default: false
-
+  max_run_duration:
+    description: "Maximum run duration of the VM (e.g. 3600s, 1h). After this duration, the VM will be terminated."
+    required: false
 outputs:
   label:
     description: >-
@@ -150,6 +152,7 @@ runs:
         --maintenance_policy_terminate=${{ inputs.maintenance_policy_terminate }}
         --instance_termination_action_delete=${{inputs.instance_termination_action_delete}}
         --arm=${{ inputs.arm }}
+        --max_run_duration=${{ inputs.max_run_duration }}
       shell: bash
 
     - id: output

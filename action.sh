@@ -41,6 +41,7 @@ maintenance_policy_terminate=
 instance_termination_action_delete=
 arm=
 accelerator=
+max_run_duration=
 
 OPTLIND=1
 while getopts_long :h opt \
@@ -69,6 +70,7 @@ while getopts_long :h opt \
   maintenance_policy_terminate optional_argument \
   instance_termination_action_delete optional_argument \
   accelerator optional_argument \
+  max_run_duration optional_argument \
   help no_argument "" "$@"
 do
   case "$opt" in
@@ -146,7 +148,10 @@ do
       ;;
     accelerator)
       accelerator=$OPTLARG
-      ;;      
+      ;;
+    max_run_duration)
+      max_run_duration=${OPTLARG-$max_run_duration}
+      ;;
     h|help)
       usage
       exit 0
@@ -191,7 +196,7 @@ function start_vm {
   #   - All characters must be either a hyphen (-) or alphanumeric
   # - repository name
   #   - Max length: 100 code points
-  #   - All code points must be either a hyphen (-), an underscore (_), a period (.), 
+  #   - All code points must be either a hyphen (-), an underscore (_), a period (.),
   #     or an ASCII alphanumeric code point
   # ref: https://github.com/dead-claudia/github-limits
   function truncate_to_label {
@@ -230,6 +235,7 @@ function start_vm {
   accelerator=$([[ ! -z "${accelerator}"  ]] && echo "--accelerator=${accelerator} --maintenance-policy=TERMINATE" || echo "")
   maintenance_policy_flag=$([[ -z "${maintenance_policy_terminate}"  ]] || echo "--maintenance-policy=TERMINATE" )
   instance_termination_action_flag=$([[ -z "${instance_termination_action_delete}"  ]] || echo "--instance-termination-action=DELETE" )
+  max_run_duration_flag=$([[ -z "${max_run_duration}" ]] || echo "--max-run-duration=${max_run_duration}")
 
   echo "The new GCE VM will be ${VM_ID}"
 
@@ -374,6 +380,7 @@ function start_vm {
     ${accelerator} \
     ${maintenance_policy_flag} \
     ${instance_termination_action_flag} \
+    ${max_run_duration_flag} \
     --labels=gh_ready=0,gh_repo_owner="${gh_repo_owner}",gh_repo="${gh_repo}",gh_run_id="${gh_run_id}",gh_run_attempt="${gh_run_attempt}",gh_job="${gh_job}" \
     --metadata-from-file=shutdown-script=/tmp/shutdown_script.sh \
     --metadata=startup-script="$startup_script"
