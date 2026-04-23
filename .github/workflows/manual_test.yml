@@ -7,6 +7,9 @@ on:
         description: GCE zone
         default: "us-east1-c"
         required: true
+      fallback_zones:
+        description: Optional comma-separated fallback GCE zones.
+        required: false
       machine_type:
         description: "GCE machine type: https://cloud.google.com/compute/docs/machine-types"
         default: "n1-standard-4"
@@ -35,6 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       label: ${{ steps.create-runner.outputs.label }}
+      resolved_machine_zone: ${{ steps.create-runner.outputs.resolved_machine_zone }}
     steps:
       - id: create-runner
         uses: related-sciences/gce-github-runner@main
@@ -43,6 +47,7 @@ jobs:
           project_id: ${{ secrets.GCP_PROJECT_ID }}
           service_account_key: ${{ secrets.GCP_SA_KEY }}
           machine_zone: ${{ inputs.machine_zone }}
+          fallback_zones: ${{ inputs.fallback_zones }}
           machine_type: ${{ inputs.machine_type }}
           disk_size: ${{ inputs.disk_size }}
           runner_service_account: ${{ inputs.runner_service_account }}
@@ -56,4 +61,5 @@ jobs:
     needs: create-runner
     runs-on: ${{ needs.create-runner.outputs.label }}
     steps:
+      - run: echo "This runner was created in ${{ needs.create-runner.outputs.resolved_machine_zone }}"
       - run: echo "This runs on the GCE runner VM"

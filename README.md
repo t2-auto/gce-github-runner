@@ -13,6 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       label: ${{ steps.create-runner.outputs.label }}
+      resolved_machine_zone: ${{ steps.create-runner.outputs.resolved_machine_zone }}
     steps:
       - id: create-runner
         uses: related-sciences/gce-github-runner@v0.9
@@ -20,6 +21,8 @@ jobs:
           token: ${{ secrets.GH_SA_TOKEN }}
           project_id: ${{ secrets.GCP_PROJECT_ID }}
           service_account_key: ${{ secrets.GCP_SA_KEY }}
+          machine_zone: us-east1-c
+          fallback_zones: us-east1-b,us-east1-d
           image_project: ubuntu-os-cloud
           image_family: ubuntu-2004-lts
 
@@ -27,6 +30,7 @@ jobs:
     needs: create-runner
     runs-on: ${{ needs.create-runner.outputs.label }}
     steps:
+      - run: echo "Runner zone: ${{ needs.create-runner.outputs.resolved_machine_zone }}"
       - run: echo "This runs on the GCE VM"
 ```
 
@@ -37,6 +41,10 @@ jobs:
 ## Inputs
 
 See inputs and descriptions [here](./action.yml).
+
+If `machine_zone` is temporarily exhausted, you can provide `fallback_zones` as a comma-separated ordered list. The action exposes the chosen zone as `resolved_machine_zone`.
+
+When using `fallback_zones`, make sure any zone-specific networking assumptions still hold. In particular, a `subnet` tied to a different region can cause non-retriable instance creation failures.
 
 The GCE runner image should have at least:
  * `gcloud`
