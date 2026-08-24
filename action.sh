@@ -14,6 +14,65 @@ function safety_off {
   set +o errexit +o pipefail +o noclobber +o nounset
 }
 
+# Converts a single reservation_preference entry into the corresponding
+# `gcloud compute instances create` flags. Returns non-zero for invalid entries.
+function reservation_flags_for {
+  local entry="${1}"
+  case "${entry}" in
+    any)
+      echo "--reservation-affinity=any"
+      ;;
+    none)
+      echo "--reservation-affinity=none"
+      ;;
+    specific:?*)
+      echo "--reservation-affinity=specific --reservation=${entry#specific:}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# Reports whether the given reservation still has free capacity.
+# When the capacity cannot be determined (missing reservation, insufficient
+# permission, unexpected output, ...) this returns success on purpose so that
+# the VM creation is still attempted and the real error surfaces from gcloud.
+function reservation_has_capacity {
+  local name="${1}"
+  local zone="${2}"
+  local described count in_use
+
+  if ! described=$(gcloud compute reservations describe "${name}" --zone="${zone}" \
+      --format='value[separator=,](specificReservation.count,specificReservation.inUseCount)' 2>&1); then
+    echo "  Could not describe reservation '${name}': ${described}"
+    echo "  Capacity is unknown. The reservation will be tried anyway."
+    return 0
+  fi
+
+  count="${described%%,*}"
+  in_use="${described##*,}"
+  if [[ ! "${count}" =~ ^[0-9]+$ ]] || [[ ! "${in_use}" =~ ^[0-9]+$ ]]; then
+    echo "  Could not determine the capacity of reservation '${name}'."
+    echo "  The reservation will be tried anyway."
+    return 0
+  fi
+
+  echo "  Reservation '${name}' usage: ${in_use}/${count}"
+  [[ "${in_use}" -lt "${count}" ]]
+}
+
+# Reports whether a failed VM creation was caused by a lack of capacity.
+# Only such failures are retried with the next reservation preference so that
+# misconfiguration (bad machine type, quota, permission, ...) fails fast.
+function is_capacity_error {
+  local output="${1}"
+  [[ "${output}" == *"RESOURCE_POOL_EXHAUSTED"* ]] ||
+    [[ "${output}" == *"does not have enough resources available"* ]] ||
+    [[ "${output}" == *"resource pool exhausted"* ]] ||
+    [[ "${output}" == *"no available resources"* ]]
+}
+
 source "${ACTION_DIR}/vendor/getopts_long.sh"
 
 command=
@@ -50,6 +109,7 @@ cache_disk_min_pool_size=
 cache_disk_idle_ttl_hours=
 cache_disk_prune_threshold=
 cache_docker_image_patterns=
+reservation_preference=
 
 OPTLIND=1
 while getopts_long :h opt \
@@ -87,6 +147,7 @@ while getopts_long :h opt \
   cache_disk_idle_ttl_hours optional_argument \
   cache_disk_prune_threshold optional_argument \
   cache_docker_image_patterns optional_argument \
+  reservation_preference optional_argument \
   help no_argument "" "$@"
 do
   case "$opt" in
@@ -191,6 +252,9 @@ do
       ;;
     cache_docker_image_patterns)
       cache_docker_image_patterns=${OPTLARG-$cache_docker_image_patterns}
+      ;;
+    reservation_preference)
+      reservation_preference=${OPTLARG-$reservation_preference}
       ;;
     h|help)
       usage
@@ -326,6 +390,29 @@ function start_vm {
     metadata_from_file="${metadata_from_file},warm-disk-pool-script=${ACTION_DIR}/warm_disk_pool.sh"
   elif [[ -n "${cache_docker_image_patterns_base64}" ]]; then
     echo "⚠️ cache_docker_image_patterns is ignored because cache_disk_pool is not set."
+  fi
+
+  # Parse the reservation preference chain, e.g. "specific:my-reservation,any".
+  # Each entry is tried in order until the VM is created.
+  reservation_entries=()
+  if [[ -n "${reservation_preference}" ]]; then
+    IFS=',' read -r -a raw_reservation_entries <<< "${reservation_preference}"
+    for raw_reservation_entry in "${raw_reservation_entries[@]}"; do
+      reservation_entry="${raw_reservation_entry//[[:space:]]/}"
+      if [[ -z "${reservation_entry}" ]]; then
+        continue
+      fi
+      if ! reservation_flags_for "${reservation_entry}" > /dev/null; then
+        echo "Invalid reservation_preference entry '${reservation_entry}'." >&2
+        echo "Each comma separated entry must be one of: any, none, specific:<reservation-name>." >&2
+        exit 1
+      fi
+      reservation_entries+=("${reservation_entry}")
+    done
+  fi
+  if [[ ${#reservation_entries[@]} -eq 0 ]]; then
+    reservation_entries=("any")
+    reservation_preference="any"
   fi
 
   echo "The new GCE VM will be ${VM_ID}"
@@ -488,25 +575,78 @@ function start_vm {
   printf '%s' "$startup_script" > /tmp/startup_script.sh
   metadata_from_file="${metadata_from_file},startup-script=/tmp/startup_script.sh"
 
-  gcloud compute instances create ${VM_ID} \
-    --zone=${machine_zone} \
-    ${disk_size_flag} \
-    ${boot_disk_type_flag} \
-    --machine-type=${machine_type} \
-    --scopes=${scopes} \
-    ${service_account_flag} \
-    ${image_project_flag} \
-    ${image_flag} \
-    ${image_family_flag} \
-    ${preemptible_flag} \
-    ${no_external_address_flag} \
-    ${subnet_flag} \
-    ${accelerator} \
-    ${maintenance_policy_flag} \
-    ${instance_termination_action_flag} \
-    ${max_run_duration_flag} \
-    --labels=gh_ready=0,gh_repo_owner="${gh_repo_owner}",gh_repo="${gh_repo}",gh_run_id="${gh_run_id}",gh_run_attempt="${gh_run_attempt}",gh_job="${gh_job}" \
-    --metadata-from-file="${metadata_from_file}"
+  function create_vm {
+    gcloud compute instances create ${VM_ID} \
+      --zone=${machine_zone} \
+      ${disk_size_flag} \
+      ${boot_disk_type_flag} \
+      --machine-type=${machine_type} \
+      --scopes=${scopes} \
+      ${service_account_flag} \
+      ${image_project_flag} \
+      ${image_flag} \
+      ${image_family_flag} \
+      ${preemptible_flag} \
+      ${no_external_address_flag} \
+      ${subnet_flag} \
+      ${accelerator} \
+      ${maintenance_policy_flag} \
+      ${instance_termination_action_flag} \
+      ${max_run_duration_flag} \
+      ${1} \
+      --labels=gh_ready=0,gh_repo_owner="${gh_repo_owner}",gh_repo="${gh_repo}",gh_run_id="${gh_run_id}",gh_run_attempt="${gh_run_attempt}",gh_job="${gh_job}" \
+      --metadata-from-file="${metadata_from_file}"
+  }
+
+  # Try each reservation preference in order until one of them yields a VM.
+  created="false"
+  entry_count="${#reservation_entries[@]}"
+  for (( entry_index = 0; entry_index < entry_count; entry_index++ )); do
+    entry="${reservation_entries[$entry_index]}"
+    reservation_flags=$(reservation_flags_for "${entry}")
+
+    echo "Creating ${VM_ID} with reservation preference '${entry}' (${reservation_flags})"
+
+    if [[ "${entry}" == specific:* ]] && ! reservation_has_capacity "${entry#specific:}" "${machine_zone}"; then
+      echo "  Reservation '${entry#specific:}' is fully consumed. Skipping this preference."
+      continue
+    fi
+
+    safety_off
+    create_output=$(create_vm "${reservation_flags}" 2>&1)
+    create_status=$?
+    safety_on
+    echo "${create_output}"
+
+    if [[ ${create_status} -eq 0 ]]; then
+      echo "${VM_ID} has been created with reservation preference '${entry}'."
+      created="true"
+      break
+    fi
+
+    # A failed attempt may still have left the instance behind, which would make
+    # the next attempt fail with "already exists".
+    safety_off
+    gcloud --quiet compute instances delete ${VM_ID} --zone=${machine_zone} > /dev/null 2>&1
+    safety_on
+
+    if [[ $(( entry_index + 1 )) -ge ${entry_count} ]]; then
+      break
+    fi
+
+    if ! is_capacity_error "${create_output}"; then
+      echo "Creating ${VM_ID} failed for a reason other than a lack of capacity." >&2
+      echo "The remaining reservation preferences will not be tried." >&2
+      break
+    fi
+
+    echo "Creating ${VM_ID} failed because of a lack of capacity. Trying the next reservation preference."
+  done
+
+  if [[ "${created}" != "true" ]]; then
+    echo "Failed to create ${VM_ID} with reservation preference '${reservation_preference}'." >&2
+    exit 1
+  fi
 
   echo "label=${VM_ID}" >> $GITHUB_OUTPUT
 
