@@ -42,6 +42,13 @@ instance_termination_action_delete=
 arm=
 accelerator=
 max_run_duration=
+cache_disk_pool=
+cache_disk_mount_point=
+cache_disk_size=
+cache_disk_type=
+cache_disk_min_pool_size=
+cache_disk_idle_ttl_hours=
+cache_disk_prune_threshold=
 
 OPTLIND=1
 while getopts_long :h opt \
@@ -71,6 +78,13 @@ while getopts_long :h opt \
   instance_termination_action_delete optional_argument \
   accelerator optional_argument \
   max_run_duration optional_argument \
+  cache_disk_pool optional_argument \
+  cache_disk_mount_point optional_argument \
+  cache_disk_size optional_argument \
+  cache_disk_type optional_argument \
+  cache_disk_min_pool_size optional_argument \
+  cache_disk_idle_ttl_hours optional_argument \
+  cache_disk_prune_threshold optional_argument \
   help no_argument "" "$@"
 do
   case "$opt" in
@@ -152,6 +166,27 @@ do
     max_run_duration)
       max_run_duration=${OPTLARG-$max_run_duration}
       ;;
+    cache_disk_pool)
+      cache_disk_pool=${OPTLARG-$cache_disk_pool}
+      ;;
+    cache_disk_mount_point)
+      cache_disk_mount_point=${OPTLARG-$cache_disk_mount_point}
+      ;;
+    cache_disk_size)
+      cache_disk_size=${OPTLARG-$cache_disk_size}
+      ;;
+    cache_disk_type)
+      cache_disk_type=${OPTLARG-$cache_disk_type}
+      ;;
+    cache_disk_min_pool_size)
+      cache_disk_min_pool_size=${OPTLARG-$cache_disk_min_pool_size}
+      ;;
+    cache_disk_idle_ttl_hours)
+      cache_disk_idle_ttl_hours=${OPTLARG-$cache_disk_idle_ttl_hours}
+      ;;
+    cache_disk_prune_threshold)
+      cache_disk_prune_threshold=${OPTLARG-$cache_disk_prune_threshold}
+      ;;
     h|help)
       usage
       exit 0
@@ -163,6 +198,18 @@ do
       ;;
   esac
 done
+
+# The cache disk settings are written verbatim into /etc/warm-disk-pool.env on the
+# VM by the startup script, and cache_disk_pool can come from a pull request label.
+# Refuse anything that is not exactly what we expect instead of trying to escape it.
+# Empty values are allowed so that the action defaults win.
+function check_cache_disk_input {
+  local name="${1}" value="${2}" pattern="${3}"
+  if [[ -n "${value}" && ! "${value}" =~ ${pattern} ]]; then
+    echo "❌ ${name} must match ${pattern}, got '${value}'"
+    exit 1
+  fi
+}
 
 function gcloud_auth {
   # NOTE: when --project is specified, it updates the config
@@ -237,10 +284,28 @@ function start_vm {
   instance_termination_action_flag=$([[ -z "${instance_termination_action_delete}"  ]] || echo "--instance-termination-action=DELETE" )
   max_run_duration_flag=$([[ -z "${max_run_duration}" ]] || echo "--max-run-duration=${max_run_duration}")
 
+  # The warm cache disk pool is opt-in: an empty cache_disk_pool leaves the VM
+  # untouched. The pool name doubles as the cache key and is stored as a Compute
+  # Engine label, so reject anything a label cannot hold rather than normalising
+  # it, which could silently collapse two cache keys onto one pool.
+  metadata_from_file="shutdown-script=/tmp/shutdown_script.sh"
+  if [[ -n "${cache_disk_pool}" ]]; then
+    check_cache_disk_input cache_disk_pool "${cache_disk_pool}" '^[a-z0-9_-]{1,63}$'
+    check_cache_disk_input cache_disk_mount_point "${cache_disk_mount_point}" '^/[A-Za-z0-9._/-]+$'
+    check_cache_disk_input cache_disk_size "${cache_disk_size}" '^[0-9]+(GB|TB|GiB|TiB)?$'
+    check_cache_disk_input cache_disk_type "${cache_disk_type}" '^[a-z0-9-]+$'
+    check_cache_disk_input cache_disk_min_pool_size "${cache_disk_min_pool_size}" '^[0-9]+$'
+    check_cache_disk_input cache_disk_idle_ttl_hours "${cache_disk_idle_ttl_hours}" '^[0-9]+$'
+    check_cache_disk_input cache_disk_prune_threshold "${cache_disk_prune_threshold}" '^([0-9]|[1-9][0-9]|100)$'
+    metadata_from_file="${metadata_from_file},warm-disk-pool-script=${ACTION_DIR}/warm_disk_pool.sh"
+  fi
+
   echo "The new GCE VM will be ${VM_ID}"
 
   cat <<-EOT > /tmp/shutdown_script.sh
 	#!/bin/bash
+	# Hand the cache disk back on every shutdown path, not just preemption.
+	[[ -x /usr/bin/warm_disk_pool.sh ]] && /usr/bin/warm_disk_pool.sh release
 	preempted=\$(curl -Ss http://metadata.google.internal/computeMetadata/v1/instance/preempted -H 'Metadata-Flavor: Google')
 	if [[ \$preempted = 'TRUE' ]]; then
 	pr_numbers=\$(curl -sSL \\
@@ -267,6 +332,29 @@ function start_vm {
 	# Install NVIDIA driver if exists
 	[[ -x /opt/deeplearning/install-driver.sh ]] && /opt/deeplearning/install-driver.sh
 
+	# Warm cache disk pool. The manager script rides along in instance metadata and
+	# is only present when cache_disk_pool was set, so everything below is a no-op
+	# otherwise. Acquiring here means the cache is mounted before the runner
+	# registers, and therefore before any job step can look for it.
+	cat <<-EOF > /etc/warm-disk-pool.env
+	CACHE_DISK_POOL=${cache_disk_pool}
+	CACHE_DISK_ZONE=${machine_zone}
+	CACHE_DISK_VM=${VM_ID}
+	CACHE_DISK_MOUNT_POINT=${cache_disk_mount_point}
+	CACHE_DISK_SIZE=${cache_disk_size}
+	CACHE_DISK_TYPE=${cache_disk_type}
+	CACHE_DISK_MIN_POOL_SIZE=${cache_disk_min_pool_size}
+	CACHE_DISK_IDLE_TTL_HOURS=${cache_disk_idle_ttl_hours}
+	CACHE_DISK_PRUNE_THRESHOLD=${cache_disk_prune_threshold}
+	EOF
+	if curl -sSf -H 'Metadata-Flavor: Google' \\
+	  http://metadata.google.internal/computeMetadata/v1/instance/attributes/warm-disk-pool-script \\
+	  -o /usr/bin/warm_disk_pool.sh; then
+	  chmod +x /usr/bin/warm_disk_pool.sh
+	  # A cache miss must never fail the job, so this is best effort by design.
+	  /usr/bin/warm_disk_pool.sh acquire || true
+	fi
+
 	cat <<-'EOT' > /tmp/shutdown_script.sh
 	${shutdown_script}
 	EOT
@@ -276,6 +364,9 @@ function start_vm {
 	# Create a systemd service in charge of shutting down the machine once the workflow has finished
 	cat <<-EOF > /etc/systemd/system/shutdown.sh
 	#!/bin/sh
+	# Return the cache disk to the pool first so the next job can pick it up while
+	# this VM is still winding down.
+	[ -x /usr/bin/warm_disk_pool.sh ] && /usr/bin/warm_disk_pool.sh release
 	sleep ${shutdown_timeout}
 	CLOUDSDK_CONFIG=/tmp gcloud compute instances delete $VM_ID --zone=$machine_zone --quiet
 	EOF
@@ -382,7 +473,7 @@ function start_vm {
     ${instance_termination_action_flag} \
     ${max_run_duration_flag} \
     --labels=gh_ready=0,gh_repo_owner="${gh_repo_owner}",gh_repo="${gh_repo}",gh_run_id="${gh_run_id}",gh_run_attempt="${gh_run_attempt}",gh_job="${gh_job}" \
-    --metadata-from-file=shutdown-script=/tmp/shutdown_script.sh \
+    --metadata-from-file="${metadata_from_file}" \
     --metadata=startup-script="$startup_script"
 
   echo "label=${VM_ID}" >> $GITHUB_OUTPUT

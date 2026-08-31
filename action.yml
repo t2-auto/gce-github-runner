@@ -107,6 +107,38 @@ inputs:
   max_run_duration:
     description: "Maximum run duration of the VM (e.g. 3600s, 1h). After this duration, the VM will be terminated."
     required: false
+  cache_disk_pool:
+    description: >-
+      Name of the warm cache disk pool to check a persistent disk out of, mounted
+      at cache_disk_mount_point for the lifetime of the job. The name doubles as
+      the cache key, so two workflows sharing a name share their cached data.
+      Must match ^[a-z0-9_-]{1,63}$. Leave empty to disable the pool entirely.
+    required: false
+    default: ""
+  cache_disk_mount_point:
+    description: "Where to mount the checked out cache disk."
+    required: false
+    default: "/mnt/cache"
+  cache_disk_size:
+    description: "Size of a newly created pool disk. Ignored for disks restored from the pool's golden snapshot."
+    required: false
+    default: "500GB"
+  cache_disk_type:
+    description: "Disk type of a newly created pool disk."
+    required: false
+    default: "pd-balanced"
+  cache_disk_min_pool_size:
+    description: "Number of disks to keep in the pool even when they sit idle, so the next job still finds a warm one."
+    required: false
+    default: "2"
+  cache_disk_idle_ttl_hours:
+    description: "How long a free disk may sit unused before it becomes eligible for removal, once the pool is above cache_disk_min_pool_size."
+    required: false
+    default: "24"
+  cache_disk_prune_threshold:
+    description: "Disk usage percentage above which the least recently used cache entries are dropped on release."
+    required: false
+    default: "80"
 outputs:
   label:
     description: >-
@@ -153,6 +185,24 @@ runs:
         --instance_termination_action_delete=${{inputs.instance_termination_action_delete}}
         --arm=${{ inputs.arm }}
         --max_run_duration=${{ inputs.max_run_duration }}
+        --cache_disk_pool="$CACHE_DISK_POOL"
+        --cache_disk_mount_point="$CACHE_DISK_MOUNT_POINT"
+        --cache_disk_size="$CACHE_DISK_SIZE"
+        --cache_disk_type="$CACHE_DISK_TYPE"
+        --cache_disk_min_pool_size="$CACHE_DISK_MIN_POOL_SIZE"
+        --cache_disk_idle_ttl_hours="$CACHE_DISK_IDLE_TTL_HOURS"
+        --cache_disk_prune_threshold="$CACHE_DISK_PRUNE_THRESHOLD"
+      # Passed through the environment rather than interpolated into the command:
+      # cache_disk_pool can come from a pull request label, and these values end up
+      # in a root-owned file on the runner VM.
+      env:
+        CACHE_DISK_POOL: ${{ inputs.cache_disk_pool }}
+        CACHE_DISK_MOUNT_POINT: ${{ inputs.cache_disk_mount_point }}
+        CACHE_DISK_SIZE: ${{ inputs.cache_disk_size }}
+        CACHE_DISK_TYPE: ${{ inputs.cache_disk_type }}
+        CACHE_DISK_MIN_POOL_SIZE: ${{ inputs.cache_disk_min_pool_size }}
+        CACHE_DISK_IDLE_TTL_HOURS: ${{ inputs.cache_disk_idle_ttl_hours }}
+        CACHE_DISK_PRUNE_THRESHOLD: ${{ inputs.cache_disk_prune_threshold }}
       shell: bash
 
     - id: output
