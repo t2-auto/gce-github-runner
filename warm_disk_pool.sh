@@ -8,8 +8,10 @@
 #
 #   acquire   grab a free disk from the pool and mount it (run before the runner
 #             registers, so the cache is ready for every step of the job)
-#   release   prune, unmount, refresh the golden snapshot and hand the disk back
-#             (run just before the VM deletes itself)
+#   release [--skip-prune]
+#             prune, unmount, refresh the golden snapshot and hand the disk back
+#             (run just before the VM deletes itself). --skip-prune is for the
+#             preemption path, where there is no time for a prune.
 #   gc        housekeeping that the release path cannot do: recover disks orphaned
 #             by an abrupt VM death. Optional, meant for a scheduled workflow.
 #
@@ -129,6 +131,10 @@ function list_pool_json {
   echo "${json}" | jq '[ .[] | select(.labels.state != "quarantined") ]'
 }
 
+# A disk is free when nothing is attached to it. Compute Engine's own users[] is
+# the source of truth here, deliberately: a label saying "in use" could be left
+# behind by a VM that died, whereas users[] cannot lie. Nothing on the hot path has
+# to write state.
 function jq_free_disks {
   jq -r '.[] | select((.users // []) | length == 0) | .name'
 }
@@ -205,6 +211,12 @@ function quarantine_disk {
   set_disk_labels "${disk}" "state=quarantined"
 }
 
+# Attaches one candidate disk and mounts it, or gives up on it. Returns non-zero
+# for "try the next candidate", never for "abort".
+#
+# A failed attach is the expected outcome of losing a race, not an error: another
+# VM grabbed this disk between our listing and our attach. That is precisely the
+# mutual exclusion we want, so the caller just moves on to the next candidate.
 function attach_and_mount {
   local disk="${1}"
 
@@ -231,6 +243,14 @@ function attach_and_mount {
   fi
 }
 
+# Grows the pool by one disk, seeded from the golden snapshot when there is one so
+# it starts warm rather than empty. Prints the new disk name on stdout.
+#
+# The warm-<pool>-<random> naming is not cosmetic: these VMs run untrusted workflow
+# code, so the service account's disk permissions are meant to be granted through
+# an IAM condition matching this prefix rather than project wide. The last_used
+# stamp is applied at creation so that trim_pool never has to fall back to parsing
+# creationTimestamp.
 function create_pool_disk {
   local disk="warm-${POOL}-$(tr -dc 'a-z0-9' < /dev/urandom | head -c 8)"
   local snapshot
@@ -255,6 +275,12 @@ function create_pool_disk {
   echo "${disk}"
 }
 
+# Checks a disk out of the pool and mounts it. Runs from the startup script, before
+# the runner registers with GitHub, so the cache is in place before any job step
+# can look for it.
+#
+# This must never fail the job. Every failure path below degrades to running
+# without a cache, which costs time and nothing else.
 function acquire {
   if [[ -z "${POOL}" ]]; then
     return 0
@@ -365,6 +391,10 @@ function prune_cache {
   done
 }
 
+# Flushes and unmounts the cache. A clean unmount is what lets the next VM skip
+# fsck and what makes the disk safe to use as a snapshot source, so it is worth
+# escalating to killing whatever still holds the mount: the job is over and those
+# processes are leftovers.
 function unmount_cache {
   sync
   if umount "${MOUNT_POINT}" 2>/dev/null; then
@@ -617,7 +647,7 @@ function reap_quarantined {
 # ---------------------------------------------------------------------------
 
 function usage {
-  echo "Usage: ${0} <acquire|release|gc>"
+  echo "Usage: ${0} <acquire|release [--skip-prune]|gc>"
 }
 
 case "${1:-}" in
