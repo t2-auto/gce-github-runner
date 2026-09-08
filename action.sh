@@ -305,7 +305,8 @@ function start_vm {
   cat <<-EOT > /tmp/shutdown_script.sh
 	#!/bin/bash
 	# Hand the cache disk back on every shutdown path, not just preemption.
-	[[ -x /usr/bin/warm_disk_pool.sh ]] && /usr/bin/warm_disk_pool.sh release
+	# Skip the prune: preemption gives us ~30s, so spend it on a clean unmount.
+	[[ -x /usr/bin/warm_disk_pool.sh ]] && /usr/bin/warm_disk_pool.sh release --skip-prune
 	preempted=\$(curl -Ss http://metadata.google.internal/computeMetadata/v1/instance/preempted -H 'Metadata-Flavor: Google')
 	if [[ \$preempted = 'TRUE' ]]; then
 	pr_numbers=\$(curl -sSL \\

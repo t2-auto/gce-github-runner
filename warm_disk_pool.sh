@@ -49,6 +49,11 @@ MIN_POOL_SIZE="${CACHE_DISK_MIN_POOL_SIZE:-2}"
 IDLE_TTL_HOURS="${CACHE_DISK_IDLE_TTL_HOURS:-24}"
 PRUNE_THRESHOLD="${CACHE_DISK_PRUNE_THRESHOLD:-80}"
 SNAPSHOT_REFRESH_HOURS="${CACHE_DISK_SNAPSHOT_REFRESH_HOURS:-24}"
+# Wall clock budget for pruning. Pruning happens on the way out, so it delays
+# nothing, but it must not run unbounded either: a several hundred GB disk can
+# keep `find -delete` busy for a long time and the disk stays checked out until it
+# finishes.
+PRUNE_TIMEOUT_SECONDS="${CACHE_DISK_PRUNE_TIMEOUT_SECONDS:-300}"
 
 export CLOUDSDK_CONFIG="${CLOUDSDK_CONFIG:-/tmp}"
 
@@ -94,7 +99,8 @@ function require_config {
 # up front, rather than discovering the problem halfway through a release.
 function validate_numeric_config {
   local name value
-  for name in MIN_POOL_SIZE IDLE_TTL_HOURS PRUNE_THRESHOLD SNAPSHOT_REFRESH_HOURS; do
+  for name in MIN_POOL_SIZE IDLE_TTL_HOURS PRUNE_THRESHOLD SNAPSHOT_REFRESH_HOURS \
+              PRUNE_TIMEOUT_SECONDS; do
     value="${!name}"
     if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
       warn "${name} must be a non-negative integer, got '${value}'"
@@ -308,22 +314,50 @@ function acquire {
 # release
 # ---------------------------------------------------------------------------
 
+function disk_usage_pct {
+  df --output=pcent "${MOUNT_POINT}" 2>/dev/null | tail -1 | tr -dc '0-9' || true
+}
+
 # Bazel's disk cache has no built in eviction, so it grows without bound. Drop the
 # least recently used entries when the disk gets full. This runs on the way out so
 # that it never delays the start of a job.
+#
+# Working from 30 days down to 1 rather than cutting straight to the shortest
+# window keeps the eviction proportional: we stop as soon as the disk is back under
+# the threshold, instead of throwing away most of the cache on the one day it
+# happened to fill up.
+#
+# The whole thing is bounded by PRUNE_TIMEOUT_SECONDS. Being cut short is harmless
+# -- the disk is merely fuller than we would like for the next job -- whereas
+# running unbounded would keep the disk checked out and delay the snapshot refresh.
 function prune_cache {
   local usage
-  usage=$(df --output=pcent "${MOUNT_POINT}" 2>/dev/null | tail -1 | tr -dc '0-9' || true)
+  usage=$(disk_usage_pct)
   [[ -n "${usage}" ]] || return 0
   if [[ "${usage}" -le "${PRUNE_THRESHOLD}" ]]; then
     return 0
   fi
 
+  local deadline=$(( $(now_epoch) + PRUNE_TIMEOUT_SECONDS ))
   log "usage is ${usage}% (threshold ${PRUNE_THRESHOLD}%), pruning"
-  local days
+
+  local days remaining rc
   for days in 30 14 7 3 1; do
-    find "${MOUNT_POINT}" -type f -atime +"${days}" -delete 2>/dev/null || true
-    usage=$(df --output=pcent "${MOUNT_POINT}" 2>/dev/null | tail -1 | tr -dc '0-9' || true)
+    remaining=$(( deadline - $(now_epoch) ))
+    if [[ "${remaining}" -le 0 ]]; then
+      warn "  prune budget of ${PRUNE_TIMEOUT_SECONDS}s is spent, stopping at ${usage}%"
+      return 0
+    fi
+
+    rc=0
+    timeout "${remaining}" find "${MOUNT_POINT}" -type f -atime +"${days}" -delete \
+      2>/dev/null || rc=$?
+    usage=$(disk_usage_pct)
+    if [[ "${rc}" -eq 124 ]]; then
+      warn "  prune budget of ${PRUNE_TIMEOUT_SECONDS}s is spent, stopping at ${usage}%"
+      return 0
+    fi
+
     log "  after dropping entries older than ${days}d: ${usage}%"
     if [[ -n "${usage}" && "${usage}" -le "${PRUNE_THRESHOLD}" ]]; then
       break
@@ -441,7 +475,18 @@ function trim_pool {
   done
 }
 
+# release [--skip-prune]
+#
+# --skip-prune is for the preemption path, where Compute Engine gives us about 30
+# seconds before the VM is gone. There is no point starting a prune we cannot
+# finish; unmounting cleanly matters far more, because it is what lets the next VM
+# skip fsck and what makes the disk safe to snapshot.
 function release {
+  local skip_prune="false"
+  if [[ "${1:-}" == "--skip-prune" ]]; then
+    skip_prune="true"
+  fi
+
   if [[ -z "${POOL}" ]]; then
     return 0
   fi
@@ -462,7 +507,11 @@ function release {
   fi
 
   log "releasing ${disk}"
-  prune_cache || true
+  if [[ "${skip_prune}" == "true" ]]; then
+    log "  skipping prune, unmounting cleanly is the priority"
+  else
+    prune_cache || true
+  fi
   local unmounted="false"
   if unmount_cache; then
     unmounted="true"
@@ -573,7 +622,7 @@ function usage {
 
 case "${1:-}" in
   acquire) acquire ;;
-  release) release ;;
+  release) release "${2:-}" ;;
   gc)      gc ;;
   *)       usage; exit 1 ;;
 esac

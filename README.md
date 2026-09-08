@@ -78,7 +78,12 @@ of emptying it over a quiet weekend and leaving Monday morning cold.
 
 Since a disk cache has no eviction of its own, `cache_disk_prune_threshold` caps
 how full a disk may get; older entries are dropped on release, so pruning never
-delays the start of a job.
+delays the start of a job. Eviction walks back from 30 days to 1 and stops as soon
+as the disk is under the threshold, so a disk that happens to fill up loses only
+what it has to. The whole prune is bounded by a wall clock budget
+(`CACHE_DISK_PRUNE_TIMEOUT_SECONDS`, 300s), and is skipped entirely when the VM is
+being preempted: Compute Engine gives roughly 30 seconds there, which is better
+spent unmounting cleanly than on a prune that cannot finish.
 
 **The pool name is the cache key.** Two workflows that share a name share their
 cached data, which is usually what you want — the more jobs share a pool, the
