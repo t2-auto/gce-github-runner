@@ -482,7 +482,9 @@ function trim_pool {
 
   # Free disks that have not been used since the cutoff, oldest first. Every pool
   # disk is stamped with last_used when it is created and again on every release,
-  # so a disk without the label has been tampered with and is left alone.
+  # so a disk without the label has been tampered with and is left alone. A
+  # non-numeric stamp makes tonumber abort jq; treat that as "nothing to trim"
+  # rather than letting it take the whole run down.
   local stale
   stale=$(echo "${disks_json}" | jq -r --argjson cutoff "${cutoff}" '
     [ .[]
@@ -490,7 +492,7 @@ function trim_pool {
       | select(.labels.last_used != null)
       | { name: .name, used: (.labels.last_used | tonumber) }
       | select(.used < $cutoff) ]
-    | sort_by(.used) | .[].name')
+    | sort_by(.used) | .[].name' || true)
 
   local deletable=$(( pool_size - MIN_POOL_SIZE ))
   local budget=$(( deletable < MAX_TRIM_PER_RUN ? deletable : MAX_TRIM_PER_RUN ))

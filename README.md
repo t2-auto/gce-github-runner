@@ -119,11 +119,20 @@ Note that these VMs run whatever code the workflow gives them, including code fr
 pull requests on a public repository. Grant the disk permissions through an IAM
 condition scoped to the pool's own resources rather than to the whole project.
 Pool disks are named `warm-<pool>-<random>` and snapshots `warm-<pool>-<epoch>`
-precisely so that such a condition can be written:
+precisely so that such a condition can be written. **Scope it to the individual
+pool**, not to the `warm-` prefix as a whole:
 
 ```
-resource.name.startsWith("projects/PROJECT/zones/ZONE/disks/warm-")
+resource.name.startsWith("projects/PROJECT/zones/ZONE/disks/warm-my-repo-bazel-")
 ```
+
+The prefix matters because the pool name is workflow controlled — the caller
+action even lets a pull request label override it. A condition that stops at
+`warm-` grants the service account every pool it can name, so a pull request could
+point itself at another team's pool and read or poison a cache that a trusted
+build later consumes. With a per-pool condition the same attempt simply fails IAM
+and the job runs without a cache, which is the intended failure mode. One service
+account per trust domain, one condition per pool it may use.
 
 ## Example Workflows
 
