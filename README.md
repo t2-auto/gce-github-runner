@@ -43,6 +43,35 @@ The GCE runner image should have at least:
  * `git`
  * (optionally) GitHub Actions Runner (see `actions_preinstalled` parameter)
 
+### Reservations
+
+`reservation_preference` controls how the runner VM consumes [Compute Engine reservations](https://cloud.google.com/compute/docs/instances/reservations-overview).
+It takes a comma separated list of preferences that are tried **in order** until the VM is created:
+
+| Entry | Behaviour |
+| --- | --- |
+| `any` (default) | Consume any matching automatic reservation in the project, falling back to on-demand capacity when there is none. |
+| `none` | Never consume a reservation, always use on-demand capacity. |
+| `specific:<name>` | Consume the named reservation only. Fails when it is fully consumed. |
+
+```yaml
+# Use the team reservation first, then fall back to on-demand capacity.
+reservation_preference: "specific:l4-pool,none"
+
+# Use the team reservation first, then any other automatic reservation, then on-demand.
+reservation_preference: "specific:l4-pool,any"
+
+# Strictly stay inside the reservation (fails when it is full).
+reservation_preference: "specific:l4-pool"
+```
+
+Notes:
+
+* The default `any` matches the `gcloud` default, so leaving this input unset preserves the previous behaviour.
+* Before trying a `specific:<name>` entry the action checks the reservation usage and skips it when it is already fully consumed. When the usage cannot be determined (the reservation does not exist, the service account lacks `compute.reservations.get`, ...) the entry is tried anyway so that the real error surfaces from `gcloud`.
+* The next entry is only tried when the creation failed because of a **lack of capacity**. Any other failure (invalid machine type, exceeded quota, missing permission, ...) fails immediately instead of being silently retried.
+* Reservations whose `specificReservationRequired` is `true` cannot be consumed with `any`; they need an explicit `specific:<name>` entry.
+
 ## Example Workflows
 
 * [Test Workflow](./.github/workflows/test.yml): Test workflow.
