@@ -28,6 +28,11 @@ inputs:
     description: GCE zone
     default: "us-east1-c"
     required: true
+  fallback_zones:
+    description: >-
+      Optional comma-separated fallback GCE zones to try when the primary
+      machine_zone is exhausted.
+    required: false
   machine_type:
     description: GCE machine type; https://cloud.google.com/compute/docs/machine-types
     default: "n1-standard-4"
@@ -46,8 +51,8 @@ inputs:
       [count=COUNT],[type=TYPE]
         Attaches accelerators (e.g. GPUs) to the instances.
         TYPE
-        The specific type (e.g. nvidia-tesla-k80 for nVidia Tesla K80) of accelerator 
-        to attach to the instances. Use 'gcloud compute accelerator-types list' to 
+        The specific type (e.g. nvidia-tesla-k80 for nVidia Tesla K80) of accelerator
+        to attach to the instances. Use 'gcloud compute accelerator-types list' to
         learn about all available accelerator types.
         COUNT
         Number of accelerators to attach to each instance. The default value is 1.
@@ -119,6 +124,11 @@ outputs:
   internal_conclusion:
     description: Conclusion of the internal gce-github-runner-script action
     value: ${{ steps.output.outputs.internal_conclusion }}
+  resolved_machine_zone:
+    description: >-
+      The GCE zone where the runner VM was actually created after applying
+      any configured fallback zones.
+    value: ${{ steps.gce-github-runner-script.outputs.resolved_machine_zone }}
 
 runs:
   using: "composite"
@@ -126,13 +136,14 @@ runs:
     - id: gce-github-runner-script
       continue-on-error: ${{ inputs.fallback_runs_on_enabled == 'true' }}
       run: >
-        ${{ github.action_path }}/action.sh
+        bash ${{ github.action_path }}/entrypoint.sh
         --command=start
         --token=${{ inputs.token }}
         --project_id=${{ inputs.project_id }}
         --service_account_key='${{ inputs.service_account_key }}'
         --runner_ver=${{ inputs.runner_ver }}
         --machine_zone=${{ inputs.machine_zone }}
+        --fallback_zones='${{ inputs.fallback_zones }}'
         --machine_type=${{ inputs.machine_type }}
         --network=${{ inputs.network }}
         --subnet=${{ inputs.subnet }}
