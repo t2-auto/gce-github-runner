@@ -76,6 +76,17 @@ than `cache_disk_idle_ttl_hours`, never dropping below
 deliberate: it returns the pool to its baseline while a burst is draining, instead
 of emptying it over a quiet weekend and leaving Monday morning cold.
 
+Compute Engine lets a given snapshot seed [at most six new disks per zone per
+hour](https://cloud.google.com/compute/docs/disks/snapshot-best-practices#freq_limits),
+and that limit is best effort rather than a quota you can raise. A burst wider than
+that therefore cannot restore every new disk from the golden snapshot. When the
+restore is refused the disk is created empty instead, so the pool still grows and
+the job still gets a disk — just a cold one, which the next release warms up. In
+other words a wide burst degrades gradually rather than leaving the pool stuck at
+its current size with every queued job running cacheless. If your bursts routinely
+outrun this, the documented remedy is to seed from a custom image rather than a
+snapshot; that is not implemented here.
+
 Since a disk cache has no eviction of its own, `cache_disk_prune_threshold` caps
 how full a disk may get; older entries are dropped on release, so pruning never
 delays the start of a job. Eviction walks back from 30 days to 1 and stops as soon

@@ -8,10 +8,10 @@
 #
 #   acquire   grab a free disk from the pool and mount it (run before the runner
 #             registers, so the cache is ready for every step of the job)
-#   release [--skip-prune]
+#   release [--preempted]
 #             prune, unmount, refresh the golden snapshot and hand the disk back
-#             (run just before the VM deletes itself). --skip-prune is for the
-#             preemption path, where there is no time for a prune.
+#             (run just before the VM deletes itself). --preempted is for the
+#             preemption path, where there is only time to unmount.
 #   gc        housekeeping that the release path cannot do: recover disks orphaned
 #             by an abrupt VM death. Optional, meant for a scheduled workflow.
 #
@@ -56,6 +56,9 @@ SNAPSHOT_REFRESH_HOURS="${CACHE_DISK_SNAPSHOT_REFRESH_HOURS:-24}"
 # keep `find -delete` busy for a long time and the disk stays checked out until it
 # finishes.
 PRUNE_TIMEOUT_SECONDS="${CACHE_DISK_PRUNE_TIMEOUT_SECONDS:-300}"
+# How long to wait for a started snapshot to capture its point in time before
+# returning the disk to the pool. Snapshots normally leave CREATING within seconds.
+SNAPSHOT_CAPTURE_TIMEOUT_SECONDS="${CACHE_DISK_SNAPSHOT_CAPTURE_TIMEOUT_SECONDS:-120}"
 
 export CLOUDSDK_CONFIG="${CLOUDSDK_CONFIG:-/tmp}"
 
@@ -102,7 +105,7 @@ function require_config {
 function validate_numeric_config {
   local name value
   for name in MIN_POOL_SIZE IDLE_TTL_HOURS PRUNE_THRESHOLD SNAPSHOT_REFRESH_HOURS \
-              PRUNE_TIMEOUT_SECONDS; do
+              PRUNE_TIMEOUT_SECONDS SNAPSHOT_CAPTURE_TIMEOUT_SECONDS; do
     value="${!name}"
     if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
       warn "${name} must be a non-negative integer, got '${value}'"
@@ -154,9 +157,25 @@ function attached_disk_name {
     || true
 }
 
+# Newest snapshot that can actually be used as a disk source. Snapshots are taken
+# asynchronously, so the newest one is regularly still CREATING or UPLOADING, and
+# handing such a name to `disks create --source-snapshot` fails.
+function newest_ready_snapshot {
+  gcloud compute snapshots list \
+    --filter="labels.pool=${POOL} AND status=READY" \
+    --sort-by=~creationTimestamp \
+    --limit=1 \
+    --format="value(name)" 2>/dev/null || true
+}
+
+# Newest snapshot for the purpose of deciding whether a refresh is due. This one
+# deliberately counts snapshots that are still in flight: several VMs releasing at
+# once would otherwise all conclude that the golden snapshot is stale and start
+# their own. FAILED is excluded, because a failed snapshot left at the head of the
+# list would otherwise suppress refreshes until it ages past the TTL.
 function newest_pool_snapshot {
   gcloud compute snapshots list \
-    --filter="labels.pool=${POOL}" \
+    --filter="labels.pool=${POOL} AND status=(READY CREATING UPLOADING)" \
     --sort-by=~creationTimestamp \
     --limit=1 \
     --format="value(name)" 2>/dev/null || true
@@ -254,25 +273,45 @@ function attach_and_mount {
 function create_pool_disk {
   local disk="warm-${POOL}-$(tr -dc 'a-z0-9' < /dev/urandom | head -c 8)"
   local snapshot
-  snapshot=$(newest_pool_snapshot)
+  snapshot=$(newest_ready_snapshot)
 
   if [[ -n "${snapshot}" ]]; then
     log "  creating ${disk} from snapshot ${snapshot}"
-    gcloud compute disks create "${disk}" \
-      --zone="${ZONE}" \
-      --source-snapshot="${snapshot}" \
-      --type="${DISK_TYPE}" \
-      --labels="pool=${POOL},last_used=$(now_epoch)" > /dev/null || return 1
+    if create_disk_from_snapshot "${disk}" "${snapshot}"; then
+      echo "${disk}"
+      return 0
+    fi
+    # Compute Engine allows a given snapshot to seed at most six new disks per zone
+    # per hour, and the limit is best effort rather than an adjustable quota. A wide
+    # burst therefore runs into it precisely when the pool most needs to grow, so
+    # fall back to an empty disk instead of leaving this job — and every job behind
+    # it, since the pool would stop growing — with no cache at all. The disk joins
+    # the pool and the next release makes it warm.
+    warn "  could not create ${disk} from ${snapshot}, falling back to an empty disk"
   else
     log "  no golden snapshot for pool '${POOL}', creating empty ${disk}"
-    gcloud compute disks create "${disk}" \
-      --zone="${ZONE}" \
-      --size="${DISK_SIZE}" \
-      --type="${DISK_TYPE}" \
-      --labels="pool=${POOL},last_used=$(now_epoch)" > /dev/null || return 1
   fi
 
+  create_empty_disk "${disk}" || return 1
   echo "${disk}"
+}
+
+function create_disk_from_snapshot {
+  local disk="${1}" snapshot="${2}"
+  gcloud compute disks create "${disk}" \
+    --zone="${ZONE}" \
+    --source-snapshot="${snapshot}" \
+    --type="${DISK_TYPE}" \
+    --labels="pool=${POOL},last_used=$(now_epoch)" > /dev/null 2>&1 || return 1
+}
+
+function create_empty_disk {
+  local disk="${1}"
+  gcloud compute disks create "${disk}" \
+    --zone="${ZONE}" \
+    --size="${DISK_SIZE}" \
+    --type="${DISK_TYPE}" \
+    --labels="pool=${POOL},last_used=$(now_epoch)" > /dev/null || return 1
 }
 
 # Checks a disk out of the pool and mounts it. Runs from the startup script, before
@@ -413,6 +452,14 @@ function unmount_cache {
 # Refreshes the golden snapshot used to seed brand new pool disks. Snapshotting a
 # disk that we have just cleanly unmounted gives the warmest possible seed, so no
 # separate warming job is needed.
+#
+# The snapshot is started asynchronously and then waited on only until it leaves
+# CREATING. A Compute Engine snapshot fixes its point in time at the CREATING ->
+# UPLOADING transition, not when it finally reaches READY, and Google's own guidance
+# for consistent snapshots is to resume writing only once UPLOADING is reached. We
+# hand the disk straight back to the pool afterwards, so returning it while the
+# snapshot was still CREATING would let the next VM's writes land in the seed that
+# every future pool disk is built from.
 function refresh_snapshot {
   local disk="${1}"
   local newest created_iso created_epoch age_hours
@@ -430,19 +477,55 @@ function refresh_snapshot {
     fi
   fi
 
+  local name="warm-${POOL}-$(now_epoch)"
   log "refreshing the golden snapshot for pool '${POOL}'"
   gcloud compute disks snapshot "${disk}" \
     --zone="${ZONE}" \
-    --snapshot-names="warm-${POOL}-$(now_epoch)" \
+    --snapshot-names="${name}" \
     --labels="pool=${POOL}" \
     --async > /dev/null 2>&1 || {
       warn "could not start a snapshot of ${disk}"
       return 0
     }
 
+  wait_for_snapshot_capture "${name}"
+  prune_snapshot_generations
+}
+
+# Blocks until the snapshot has captured its point in time, i.e. until it is no
+# longer CREATING. Being cut short is not a correctness problem by itself: the
+# caller only uses this to decide it is safe to return the disk, and the worst case
+# is the same torn seed we would have had without the wait, which the next refresh
+# replaces.
+function wait_for_snapshot_capture {
+  local name="${1}"
+  local waited=0 status
+  while [[ ${waited} -lt ${SNAPSHOT_CAPTURE_TIMEOUT_SECONDS} ]]; do
+    status=$(gcloud compute snapshots describe "${name}" \
+      --format="value(status)" 2>/dev/null || echo "")
+    case "${status}" in
+      UPLOADING|READY)
+        return 0
+        ;;
+      FAILED)
+        warn "  snapshot ${name} failed"
+        return 0
+        ;;
+    esac
+    sleep 2
+    waited=$(( waited + 2 ))
+  done
+  warn "  snapshot ${name} is still CREATING after ${SNAPSHOT_CAPTURE_TIMEOUT_SECONDS}s, returning the disk anyway"
+}
+
+# Keeps the newest SNAPSHOT_GENERATIONS snapshots and drops the rest. Only settled
+# snapshots are considered, so a snapshot another VM is still writing is never
+# counted towards the generations nor deleted out from under it. FAILED ones are
+# included so that they do not accumulate.
+function prune_snapshot_generations {
   local stale
   stale=$(gcloud compute snapshots list \
-    --filter="labels.pool=${POOL}" \
+    --filter="labels.pool=${POOL} AND status=(READY FAILED)" \
     --sort-by=~creationTimestamp \
     --format="value(name)" 2>/dev/null | tail -n +$(( SNAPSHOT_GENERATIONS + 1 )) || true)
   local snap
@@ -507,16 +590,17 @@ function trim_pool {
   done
 }
 
-# release [--skip-prune]
+# release [--preempted]
 #
-# --skip-prune is for the preemption path, where Compute Engine gives us about 30
-# seconds before the VM is gone. There is no point starting a prune we cannot
-# finish; unmounting cleanly matters far more, because it is what lets the next VM
-# skip fsck and what makes the disk safe to snapshot.
+# --preempted is for the preemption path, where Compute Engine gives us about 30
+# seconds before the VM is gone. Unmounting cleanly is what matters there, because
+# it is what lets the next VM skip fsck; both the prune and the golden snapshot
+# refresh are skipped, since neither can finish inside that budget and a snapshot
+# we abandon halfway would hold the disk out of the pool while it settles.
 function release {
-  local skip_prune="false"
-  if [[ "${1:-}" == "--skip-prune" ]]; then
-    skip_prune="true"
+  local preempted="false"
+  if [[ "${1:-}" == "--preempted" ]]; then
+    preempted="true"
   fi
 
   if [[ -z "${POOL}" ]]; then
@@ -539,8 +623,8 @@ function release {
   fi
 
   log "releasing ${disk}"
-  if [[ "${skip_prune}" == "true" ]]; then
-    log "  skipping prune, unmounting cleanly is the priority"
+  if [[ "${preempted}" == "true" ]]; then
+    log "  preempted, skipping the prune so the unmount gets the whole budget"
   else
     prune_cache || true
   fi
@@ -550,8 +634,9 @@ function release {
   fi
   set_disk_labels "${disk}" "last_used=$(now_epoch)"
   # Only snapshot a disk we know is quiesced, otherwise the golden image would seed
-  # new pool disks with a dirty filesystem.
-  if [[ "${unmounted}" == "true" ]]; then
+  # new pool disks with a dirty filesystem. Skipped when preempted: the snapshot has
+  # to be waited on before the disk can go back, which does not fit in 30 seconds.
+  if [[ "${unmounted}" == "true" && "${preempted}" == "false" ]]; then
     refresh_snapshot "${disk}" || true
   fi
 
@@ -649,7 +734,7 @@ function reap_quarantined {
 # ---------------------------------------------------------------------------
 
 function usage {
-  echo "Usage: ${0} <acquire|release [--skip-prune]|gc>"
+  echo "Usage: ${0} <acquire|release [--preempted]|gc>"
 }
 
 case "${1:-}" in
