@@ -65,12 +65,62 @@ function reservation_has_capacity {
 # Reports whether a failed VM creation was caused by a lack of capacity.
 # Only such failures are retried with the next reservation preference so that
 # misconfiguration (bad machine type, quota, permission, ...) fails fast.
+#
+# The documented error codes are matched first because they are stable, and the
+# human readable messages are only used as a fallback. The messages are matched
+# case insensitively since gcloud capitalizes some of them (for example
+# "No available resources in specified reservations").
+#
+# https://cloud.google.com/compute/docs/troubleshooting/troubleshooting-resource-availability
+# https://cloud.google.com/compute/docs/instances/create-start-instance#troubleshooting
 function is_capacity_error {
   local output="${1}"
-  [[ "${output}" == *"RESOURCE_POOL_EXHAUSTED"* ]] ||
-    [[ "${output}" == *"does not have enough resources available"* ]] ||
-    [[ "${output}" == *"resource pool exhausted"* ]] ||
-    [[ "${output}" == *"no available resources"* ]]
+  local normalized
+
+  # ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS is covered by the prefix match on
+  # ZONE_RESOURCE_POOL_EXHAUSTED, which itself contains RESOURCE_POOL_EXHAUSTED.
+  if [[ "${output}" == *"RESOURCE_POOL_EXHAUSTED"* ]] ||
+    [[ "${output}" == *"POOL_CAPACITY_INSUFFICIENT_WITH_RESERVATION_AFFINITY"* ]]; then
+    return 0
+  fi
+
+  normalized=$(tr '[:upper:]' '[:lower:]' <<< "${output}")
+  [[ "${normalized}" == *"does not have enough resources available"* ]] ||
+    [[ "${normalized}" == *"resource pool exhausted"* ]] ||
+    [[ "${normalized}" == *"no available resources"* ]]
+}
+
+# Reports whether a failed VM creation was rejected because an instance with the
+# same name already exists.
+function is_already_exists_error {
+  local normalized
+  normalized=$(tr '[:upper:]' '[:lower:]' <<< "${1}")
+  [[ "${normalized}" == *"already exists"* ]]
+}
+
+# Deletes a leftover instance, but only when its labels show that it belongs to
+# this very job. Without this check a VM_ID collision (for example between
+# matrix jobs of the same run, whose GITHUB_JOB does not include the matrix
+# values) would make one job delete the running VM of another job.
+function delete_vm_if_owned {
+  local name="${1}"
+  local zone="${2}"
+  local labels
+
+  if ! labels=$(gcloud compute instances describe "${name}" --zone="${zone}" \
+      --format='value[separator=,](labels.gh_run_id,labels.gh_run_attempt,labels.gh_job)' 2>/dev/null); then
+    # Nothing was left behind.
+    return 0
+  fi
+
+  if [[ "${labels}" != "${gh_run_id},${gh_run_attempt},${gh_job}" ]]; then
+    echo "  '${name}' exists but does not belong to this job (labels: ${labels})." >&2
+    echo "  It will be left untouched." >&2
+    return 1
+  fi
+
+  echo "  Deleting the instance left behind by the failed attempt."
+  gcloud --quiet compute instances delete "${name}" --zone="${zone}" > /dev/null 2>&1 || true
 }
 
 source "${ACTION_DIR}/vendor/getopts_long.sh"
@@ -501,10 +551,18 @@ function start_vm {
       break
     fi
 
+    # An instance we did not just create must never be deleted, so a name clash
+    # is a hard failure rather than something to retry.
+    if is_already_exists_error "${create_output}"; then
+      echo "An instance named ${VM_ID} already exists and was not created by this attempt." >&2
+      echo "It is left untouched and the remaining reservation preferences are not tried." >&2
+      exit 1
+    fi
+
     # A failed attempt may still have left the instance behind, which would make
     # the next attempt fail with "already exists".
     safety_off
-    gcloud --quiet compute instances delete ${VM_ID} --zone=${machine_zone} > /dev/null 2>&1
+    delete_vm_if_owned "${VM_ID}" "${machine_zone}"
     safety_on
 
     if [[ $(( entry_index + 1 )) -ge ${entry_count} ]]; then
