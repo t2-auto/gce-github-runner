@@ -14,6 +14,115 @@ function safety_off {
   set +o errexit +o pipefail +o noclobber +o nounset
 }
 
+# Converts a single reservation_preference entry into the corresponding
+# `gcloud compute instances create` flags. Returns non-zero for invalid entries.
+function reservation_flags_for {
+  local entry="${1}"
+  case "${entry}" in
+    any)
+      echo "--reservation-affinity=any"
+      ;;
+    none)
+      echo "--reservation-affinity=none"
+      ;;
+    specific:?*)
+      echo "--reservation-affinity=specific --reservation=${entry#specific:}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# Reports whether the given reservation still has free capacity.
+# When the capacity cannot be determined (missing reservation, insufficient
+# permission, unexpected output, ...) this returns success on purpose so that
+# the VM creation is still attempted and the real error surfaces from gcloud.
+function reservation_has_capacity {
+  local name="${1}"
+  local zone="${2}"
+  local described count in_use
+
+  if ! described=$(gcloud compute reservations describe "${name}" --zone="${zone}" \
+      --format='value[separator=,](specificReservation.count,specificReservation.inUseCount)' 2>&1); then
+    echo "  Could not describe reservation '${name}': ${described}"
+    echo "  Capacity is unknown. The reservation will be tried anyway."
+    return 0
+  fi
+
+  count="${described%%,*}"
+  in_use="${described##*,}"
+  if [[ ! "${count}" =~ ^[0-9]+$ ]] || [[ ! "${in_use}" =~ ^[0-9]+$ ]]; then
+    echo "  Could not determine the capacity of reservation '${name}'."
+    echo "  The reservation will be tried anyway."
+    return 0
+  fi
+
+  echo "  Reservation '${name}' usage: ${in_use}/${count}"
+  [[ "${in_use}" -lt "${count}" ]]
+}
+
+# Reports whether a failed VM creation was caused by a lack of capacity.
+# Only such failures are retried with the next reservation preference so that
+# misconfiguration (bad machine type, quota, permission, ...) fails fast.
+#
+# The documented error codes are matched first because they are stable, and the
+# human readable messages are only used as a fallback. The messages are matched
+# case insensitively since gcloud capitalizes some of them (for example
+# "No available resources in specified reservations").
+#
+# https://cloud.google.com/compute/docs/troubleshooting/troubleshooting-resource-availability
+# https://cloud.google.com/compute/docs/instances/create-start-instance#troubleshooting
+function is_capacity_error {
+  local output="${1}"
+  local normalized
+
+  # ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS is covered by the prefix match on
+  # ZONE_RESOURCE_POOL_EXHAUSTED, which itself contains RESOURCE_POOL_EXHAUSTED.
+  if [[ "${output}" == *"RESOURCE_POOL_EXHAUSTED"* ]] ||
+    [[ "${output}" == *"POOL_CAPACITY_INSUFFICIENT_WITH_RESERVATION_AFFINITY"* ]]; then
+    return 0
+  fi
+
+  normalized=$(tr '[:upper:]' '[:lower:]' <<< "${output}")
+  [[ "${normalized}" == *"does not have enough resources available"* ]] ||
+    [[ "${normalized}" == *"resource pool exhausted"* ]] ||
+    [[ "${normalized}" == *"no available resources"* ]]
+}
+
+# Reports whether a failed VM creation was rejected because an instance with the
+# same name already exists.
+function is_already_exists_error {
+  local normalized
+  normalized=$(tr '[:upper:]' '[:lower:]' <<< "${1}")
+  [[ "${normalized}" == *"already exists"* ]]
+}
+
+# Deletes a leftover instance, but only when its labels show that it belongs to
+# this very job. Without this check a VM_ID collision (for example between
+# matrix jobs of the same run, whose GITHUB_JOB does not include the matrix
+# values) would make one job delete the running VM of another job.
+function delete_vm_if_owned {
+  local name="${1}"
+  local zone="${2}"
+  local labels
+
+  if ! labels=$(gcloud compute instances describe "${name}" --zone="${zone}" \
+      --format='value[separator=,](labels.gh_run_id,labels.gh_run_attempt,labels.gh_job)' 2>/dev/null); then
+    # Nothing was left behind.
+    return 0
+  fi
+
+  if [[ "${labels}" != "${gh_run_id},${gh_run_attempt},${gh_job}" ]]; then
+    echo "  '${name}' exists but does not belong to this job (labels: ${labels})." >&2
+    echo "  It will be left untouched." >&2
+    return 1
+  fi
+
+  echo "  Deleting the instance left behind by the failed attempt."
+  gcloud --quiet compute instances delete "${name}" --zone="${zone}" > /dev/null 2>&1 || true
+}
+
 source "${ACTION_DIR}/vendor/getopts_long.sh"
 
 command=
@@ -42,6 +151,7 @@ instance_termination_action_delete=
 arm=
 accelerator=
 max_run_duration=
+reservation_preference=
 
 OPTLIND=1
 while getopts_long :h opt \
@@ -71,6 +181,7 @@ while getopts_long :h opt \
   instance_termination_action_delete optional_argument \
   accelerator optional_argument \
   max_run_duration optional_argument \
+  reservation_preference optional_argument \
   help no_argument "" "$@"
 do
   case "$opt" in
@@ -151,6 +262,9 @@ do
       ;;
     max_run_duration)
       max_run_duration=${OPTLARG-$max_run_duration}
+      ;;
+    reservation_preference)
+      reservation_preference=${OPTLARG-$reservation_preference}
       ;;
     h|help)
       usage
@@ -236,6 +350,29 @@ function start_vm {
   maintenance_policy_flag=$([[ -z "${maintenance_policy_terminate}"  ]] || echo "--maintenance-policy=TERMINATE" )
   instance_termination_action_flag=$([[ -z "${instance_termination_action_delete}"  ]] || echo "--instance-termination-action=DELETE" )
   max_run_duration_flag=$([[ -z "${max_run_duration}" ]] || echo "--max-run-duration=${max_run_duration}")
+
+  # Parse the reservation preference chain, e.g. "specific:my-reservation,any".
+  # Each entry is tried in order until the VM is created.
+  reservation_entries=()
+  if [[ -n "${reservation_preference}" ]]; then
+    IFS=',' read -r -a raw_reservation_entries <<< "${reservation_preference}"
+    for raw_reservation_entry in "${raw_reservation_entries[@]}"; do
+      reservation_entry="${raw_reservation_entry//[[:space:]]/}"
+      if [[ -z "${reservation_entry}" ]]; then
+        continue
+      fi
+      if ! reservation_flags_for "${reservation_entry}" > /dev/null; then
+        echo "Invalid reservation_preference entry '${reservation_entry}'." >&2
+        echo "Each comma separated entry must be one of: any, none, specific:<reservation-name>." >&2
+        exit 1
+      fi
+      reservation_entries+=("${reservation_entry}")
+    done
+  fi
+  if [[ ${#reservation_entries[@]} -eq 0 ]]; then
+    reservation_entries=("any")
+    reservation_preference="any"
+  fi
 
   echo "The new GCE VM will be ${VM_ID}"
 
@@ -364,26 +501,87 @@ function start_vm {
     fi
   fi
 
-  gcloud compute instances create ${VM_ID} \
-    --zone=${machine_zone} \
-    ${disk_size_flag} \
-    ${boot_disk_type_flag} \
-    --machine-type=${machine_type} \
-    --scopes=${scopes} \
-    ${service_account_flag} \
-    ${image_project_flag} \
-    ${image_flag} \
-    ${image_family_flag} \
-    ${preemptible_flag} \
-    ${no_external_address_flag} \
-    ${subnet_flag} \
-    ${accelerator} \
-    ${maintenance_policy_flag} \
-    ${instance_termination_action_flag} \
-    ${max_run_duration_flag} \
-    --labels=gh_ready=0,gh_repo_owner="${gh_repo_owner}",gh_repo="${gh_repo}",gh_run_id="${gh_run_id}",gh_run_attempt="${gh_run_attempt}",gh_job="${gh_job}" \
-    --metadata-from-file=shutdown-script=/tmp/shutdown_script.sh \
-    --metadata=startup-script="$startup_script"
+  function create_vm {
+    gcloud compute instances create ${VM_ID} \
+      --zone=${machine_zone} \
+      ${disk_size_flag} \
+      ${boot_disk_type_flag} \
+      --machine-type=${machine_type} \
+      --scopes=${scopes} \
+      ${service_account_flag} \
+      ${image_project_flag} \
+      ${image_flag} \
+      ${image_family_flag} \
+      ${preemptible_flag} \
+      ${no_external_address_flag} \
+      ${subnet_flag} \
+      ${accelerator} \
+      ${maintenance_policy_flag} \
+      ${instance_termination_action_flag} \
+      ${max_run_duration_flag} \
+      ${1} \
+      --labels=gh_ready=0,gh_repo_owner="${gh_repo_owner}",gh_repo="${gh_repo}",gh_run_id="${gh_run_id}",gh_run_attempt="${gh_run_attempt}",gh_job="${gh_job}" \
+      --metadata-from-file=shutdown-script=/tmp/shutdown_script.sh \
+      --metadata=startup-script="$startup_script"
+  }
+
+  # Try each reservation preference in order until one of them yields a VM.
+  created="false"
+  entry_count="${#reservation_entries[@]}"
+  for (( entry_index = 0; entry_index < entry_count; entry_index++ )); do
+    entry="${reservation_entries[$entry_index]}"
+    reservation_flags=$(reservation_flags_for "${entry}")
+
+    echo "Creating ${VM_ID} with reservation preference '${entry}' (${reservation_flags})"
+
+    if [[ "${entry}" == specific:* ]] && ! reservation_has_capacity "${entry#specific:}" "${machine_zone}"; then
+      echo "  Reservation '${entry#specific:}' is fully consumed. Skipping this preference."
+      continue
+    fi
+
+    safety_off
+    create_output=$(create_vm "${reservation_flags}" 2>&1)
+    create_status=$?
+    safety_on
+    echo "${create_output}"
+
+    if [[ ${create_status} -eq 0 ]]; then
+      echo "${VM_ID} has been created with reservation preference '${entry}'."
+      created="true"
+      break
+    fi
+
+    # An instance we did not just create must never be deleted, so a name clash
+    # is a hard failure rather than something to retry.
+    if is_already_exists_error "${create_output}"; then
+      echo "An instance named ${VM_ID} already exists and was not created by this attempt." >&2
+      echo "It is left untouched and the remaining reservation preferences are not tried." >&2
+      exit 1
+    fi
+
+    # A failed attempt may still have left the instance behind, which would make
+    # the next attempt fail with "already exists".
+    safety_off
+    delete_vm_if_owned "${VM_ID}" "${machine_zone}"
+    safety_on
+
+    if [[ $(( entry_index + 1 )) -ge ${entry_count} ]]; then
+      break
+    fi
+
+    if ! is_capacity_error "${create_output}"; then
+      echo "Creating ${VM_ID} failed for a reason other than a lack of capacity." >&2
+      echo "The remaining reservation preferences will not be tried." >&2
+      break
+    fi
+
+    echo "Creating ${VM_ID} failed because of a lack of capacity. Trying the next reservation preference."
+  done
+
+  if [[ "${created}" != "true" ]]; then
+    echo "Failed to create ${VM_ID} with reservation preference '${reservation_preference}'." >&2
+    exit 1
+  fi
 
   echo "label=${VM_ID}" >> $GITHUB_OUTPUT
 

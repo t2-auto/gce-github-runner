@@ -107,6 +107,16 @@ inputs:
   max_run_duration:
     description: "Maximum run duration of the VM (e.g. 3600s, 1h). After this duration, the VM will be terminated."
     required: false
+  reservation_preference:
+    description: >-
+      Comma separated list of reservation preferences, tried in order until the VM is created.
+      Each entry must be one of "any" (consume any matching automatic reservation, falling back
+      to on-demand capacity), "none" (never consume a reservation) or "specific:<reservation-name>"
+      (consume that reservation only). Example: "specific:l4-pool,any".
+      A preference is only retried with the next entry when the creation failed because of a lack
+      of capacity; any other failure (invalid machine type, quota, permission, ...) fails immediately.
+    default: "any"
+    required: false
 outputs:
   label:
     description: >-
@@ -153,6 +163,7 @@ runs:
         --instance_termination_action_delete=${{inputs.instance_termination_action_delete}}
         --arm=${{ inputs.arm }}
         --max_run_duration=${{ inputs.max_run_duration }}
+        --reservation_preference=${{ inputs.reservation_preference }}
       shell: bash
 
     - id: output
