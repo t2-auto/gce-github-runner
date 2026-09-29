@@ -456,6 +456,9 @@ function start_vm {
     fi
   fi
 
+  printf '%s' "$startup_script" > /tmp/startup_script.sh
+  metadata_from_file="${metadata_from_file},startup-script=/tmp/startup_script.sh"
+
   gcloud compute instances create ${VM_ID} \
     --zone=${machine_zone} \
     ${disk_size_flag} \
@@ -474,8 +477,7 @@ function start_vm {
     ${instance_termination_action_flag} \
     ${max_run_duration_flag} \
     --labels=gh_ready=0,gh_repo_owner="${gh_repo_owner}",gh_repo="${gh_repo}",gh_run_id="${gh_run_id}",gh_run_attempt="${gh_run_attempt}",gh_job="${gh_job}" \
-    --metadata-from-file="${metadata_from_file}" \
-    --metadata=startup-script="$startup_script"
+    --metadata-from-file="${metadata_from_file}"
 
   echo "label=${VM_ID}" >> $GITHUB_OUTPUT
 
