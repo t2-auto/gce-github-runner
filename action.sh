@@ -49,6 +49,7 @@ cache_disk_type=
 cache_disk_min_pool_size=
 cache_disk_idle_ttl_hours=
 cache_disk_prune_threshold=
+cache_docker_image_patterns=
 
 OPTLIND=1
 while getopts_long :h opt \
@@ -85,6 +86,7 @@ while getopts_long :h opt \
   cache_disk_min_pool_size optional_argument \
   cache_disk_idle_ttl_hours optional_argument \
   cache_disk_prune_threshold optional_argument \
+  cache_docker_image_patterns optional_argument \
   help no_argument "" "$@"
 do
   case "$opt" in
@@ -187,6 +189,9 @@ do
     cache_disk_prune_threshold)
       cache_disk_prune_threshold=${OPTLARG-$cache_disk_prune_threshold}
       ;;
+    cache_docker_image_patterns)
+      cache_docker_image_patterns=${OPTLARG-$cache_docker_image_patterns}
+      ;;
     h|help)
       usage
       exit 0
@@ -209,6 +214,26 @@ function check_cache_disk_input {
     echo "❌ ${name} must match ${pattern}, got '${value}'"
     exit 1
   fi
+}
+
+function encode_cache_docker_image_patterns {
+  local raw="${1}" line
+  local patterns=()
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line%$'\r'}"
+    [[ -n "${line}" ]] || continue
+    if [[ "${line}" =~ [[:space:]] ]]; then
+      echo "❌ cache_docker_image_patterns entries must not contain whitespace: '${line}'" >&2
+      exit 1
+    fi
+    patterns+=("${line}")
+  done <<< "${raw}"
+
+  [[ "${#patterns[@]}" -gt 0 ]] || return 0
+  printf '%s\n' "${patterns[@]}" |
+    LC_ALL=C sort -u |
+    base64 |
+    tr -d '\n'
 }
 
 function gcloud_auth {
@@ -289,6 +314,7 @@ function start_vm {
   # Engine label, so reject anything a label cannot hold rather than normalising
   # it, which could silently collapse two cache keys onto one pool.
   metadata_from_file="shutdown-script=/tmp/shutdown_script.sh"
+  cache_docker_image_patterns_base64=$(encode_cache_docker_image_patterns "${cache_docker_image_patterns}")
   if [[ -n "${cache_disk_pool}" ]]; then
     check_cache_disk_input cache_disk_pool "${cache_disk_pool}" '^[a-z0-9_-]{1,63}$'
     check_cache_disk_input cache_disk_mount_point "${cache_disk_mount_point}" '^/[A-Za-z0-9._/-]+$'
@@ -298,6 +324,8 @@ function start_vm {
     check_cache_disk_input cache_disk_idle_ttl_hours "${cache_disk_idle_ttl_hours}" '^[0-9]+$'
     check_cache_disk_input cache_disk_prune_threshold "${cache_disk_prune_threshold}" '^([0-9]|[1-9][0-9]|100)$'
     metadata_from_file="${metadata_from_file},warm-disk-pool-script=${ACTION_DIR}/warm_disk_pool.sh"
+  elif [[ -n "${cache_docker_image_patterns_base64}" ]]; then
+    echo "⚠️ cache_docker_image_patterns is ignored because cache_disk_pool is not set."
   fi
 
   echo "The new GCE VM will be ${VM_ID}"
@@ -347,6 +375,7 @@ function start_vm {
 	CACHE_DISK_MIN_POOL_SIZE=${cache_disk_min_pool_size}
 	CACHE_DISK_IDLE_TTL_HOURS=${cache_disk_idle_ttl_hours}
 	CACHE_DISK_PRUNE_THRESHOLD=${cache_disk_prune_threshold}
+	CACHE_DOCKER_IMAGE_PATTERNS_BASE64=${cache_docker_image_patterns_base64}
 	EOF
 	if curl -sSf -H 'Metadata-Flavor: Google' \\
 	  http://metadata.google.internal/computeMetadata/v1/instance/attributes/warm-disk-pool-script \\

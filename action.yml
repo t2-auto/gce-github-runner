@@ -139,6 +139,13 @@ inputs:
     description: "Disk usage percentage above which the least recently used cache entries are dropped on release."
     required: false
     default: "80"
+  cache_docker_image_patterns:
+    description: >-
+      Newline-separated Bash glob patterns matched against complete repository:tag
+      references. Docker image caching is inactive when empty. All matching references
+      are saved together so shared layers are stored only once.
+    required: false
+    default: ""
 outputs:
   label:
     description: >-
@@ -192,6 +199,7 @@ runs:
         --cache_disk_min_pool_size="$CACHE_DISK_MIN_POOL_SIZE"
         --cache_disk_idle_ttl_hours="$CACHE_DISK_IDLE_TTL_HOURS"
         --cache_disk_prune_threshold="$CACHE_DISK_PRUNE_THRESHOLD"
+        --cache_docker_image_patterns="$CACHE_DOCKER_IMAGE_PATTERNS"
       # Passed through the environment rather than interpolated into the command:
       # cache_disk_pool can come from a pull request label, and these values end up
       # in a root-owned file on the runner VM.
@@ -203,6 +211,7 @@ runs:
         CACHE_DISK_MIN_POOL_SIZE: ${{ inputs.cache_disk_min_pool_size }}
         CACHE_DISK_IDLE_TTL_HOURS: ${{ inputs.cache_disk_idle_ttl_hours }}
         CACHE_DISK_PRUNE_THRESHOLD: ${{ inputs.cache_disk_prune_threshold }}
+        CACHE_DOCKER_IMAGE_PATTERNS: ${{ inputs.cache_docker_image_patterns }}
       shell: bash
 
     - id: output

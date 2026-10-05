@@ -59,6 +59,14 @@ PRUNE_TIMEOUT_SECONDS="${CACHE_DISK_PRUNE_TIMEOUT_SECONDS:-300}"
 # How long to wait for a started snapshot to capture its point in time before
 # returning the disk to the pool. Snapshots normally leave CREATING within seconds.
 SNAPSHOT_CAPTURE_TIMEOUT_SECONDS="${CACHE_DISK_SNAPSHOT_CAPTURE_TIMEOUT_SECONDS:-120}"
+# Loading or compressing large CUDA images can take a while, but must not keep a
+# disk checked out forever when Docker is unhealthy.
+DOCKER_IMAGE_CACHE_TIMEOUT_SECONDS="${CACHE_DOCKER_IMAGE_CACHE_TIMEOUT_SECONDS:-900}"
+DOCKER_IMAGE_CACHE_DIR="${MOUNT_POINT}/docker-image-cache"
+DOCKER_IMAGE_CACHE_ARCHIVE="${DOCKER_IMAGE_CACHE_DIR}/tagged-images.tar.gz"
+DOCKER_IMAGE_CACHE_PATTERNS_FILE="${DOCKER_IMAGE_CACHE_DIR}/patterns.base64"
+DOCKER_IMAGE_PATTERNS_BASE64="${CACHE_DOCKER_IMAGE_PATTERNS_BASE64:-}"
+DOCKER_IMAGE_PATTERNS=()
 
 export CLOUDSDK_CONFIG="${CLOUDSDK_CONFIG:-/tmp}"
 
@@ -105,7 +113,8 @@ function require_config {
 function validate_numeric_config {
   local name value
   for name in MIN_POOL_SIZE IDLE_TTL_HOURS PRUNE_THRESHOLD SNAPSHOT_REFRESH_HOURS \
-              PRUNE_TIMEOUT_SECONDS SNAPSHOT_CAPTURE_TIMEOUT_SECONDS; do
+              PRUNE_TIMEOUT_SECONDS SNAPSHOT_CAPTURE_TIMEOUT_SECONDS \
+              DOCKER_IMAGE_CACHE_TIMEOUT_SECONDS; do
     value="${!name}"
     if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
       warn "${name} must be a non-negative integer, got '${value}'"
@@ -314,6 +323,254 @@ function create_empty_disk {
     --labels="pool=${POOL},last_used=$(now_epoch)" > /dev/null || return 1
 }
 
+function wait_for_docker {
+  if ! command -v docker > /dev/null 2>&1; then
+    warn "docker is not installed, skipping the Docker image cache"
+    return 1
+  fi
+
+  local waited=0
+  while [[ "${waited}" -lt 60 ]]; do
+    if docker info > /dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+    waited=$(( waited + 2 ))
+  done
+  warn "Docker did not become ready within 60s, skipping the Docker image cache"
+  return 1
+}
+
+function prepare_docker_image_cache_dir {
+  if [[ -L "${DOCKER_IMAGE_CACHE_DIR}" ]]; then
+    warn "${DOCKER_IMAGE_CACHE_DIR} is a symlink, refusing to use it"
+    return 1
+  fi
+  if ! mkdir -p "${DOCKER_IMAGE_CACHE_DIR}" ||
+      [[ ! -d "${DOCKER_IMAGE_CACHE_DIR}" ]]; then
+    warn "could not create ${DOCKER_IMAGE_CACHE_DIR}"
+    return 1
+  fi
+  chmod 0700 "${DOCKER_IMAGE_CACHE_DIR}" || {
+    warn "could not secure ${DOCKER_IMAGE_CACHE_DIR}"
+    return 1
+  }
+}
+
+function configure_docker_image_patterns {
+  DOCKER_IMAGE_PATTERNS=()
+  if [[ -z "${DOCKER_IMAGE_PATTERNS_BASE64}" ]]; then
+    log "no Docker image cache patterns configured"
+    return 1
+  fi
+  if ! command -v base64 > /dev/null 2>&1; then
+    warn "base64 is not installed, skipping the Docker image cache"
+    return 1
+  fi
+
+  local decoded line
+  if ! decoded=$(printf '%s' "${DOCKER_IMAGE_PATTERNS_BASE64}" | base64 --decode 2>/dev/null); then
+    warn "CACHE_DOCKER_IMAGE_PATTERNS_BASE64 is invalid"
+    return 1
+  fi
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ -n "${line}" ]] && DOCKER_IMAGE_PATTERNS+=("${line}")
+  done <<< "${decoded}"
+  if [[ "${#DOCKER_IMAGE_PATTERNS[@]}" -eq 0 ]]; then
+    log "no Docker image cache patterns configured"
+    return 1
+  fi
+}
+
+function docker_image_matches_patterns {
+  local image="${1}" pattern
+  for pattern in "${DOCKER_IMAGE_PATTERNS[@]}"; do
+    if [[ "${image}" == ${pattern} ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+function matching_tagged_docker_images {
+  local listed image
+  listed=$(docker image ls --filter dangling=false \
+    --format '{{.Repository}}:{{.Tag}}' 2>/dev/null) || return 1
+
+  while IFS= read -r image; do
+    [[ -n "${image}" &&
+       "${image}" != '<none>:'* &&
+       "${image}" != *':<none>' ]] || continue
+    if docker_image_matches_patterns "${image}"; then
+      printf '%s\n' "${image}"
+    fi
+  done <<< "${listed}" | LC_ALL=C sort -u
+}
+
+function log_docker_image_references {
+  local verb="${1}"
+  shift
+  local image image_id
+  for image in "$@"; do
+    image_id=$(docker image inspect --format '{{.Id}}' "${image}" 2>/dev/null || echo unknown)
+    log "  ${verb} ${image} (${image_id})"
+  done
+}
+
+function cleanup_docker_image_cache_temps {
+  [[ -d "${DOCKER_IMAGE_CACHE_DIR}" &&
+     ! -L "${DOCKER_IMAGE_CACHE_DIR}" ]] || return 0
+  find "${DOCKER_IMAGE_CACHE_DIR}" -maxdepth 1 -type f \
+    \( -name '.tagged-images.tar.gz.tmp.*' -o -name '.patterns.base64.tmp.*' \) \
+    -delete 2>/dev/null || true
+}
+
+function docker_image_cache_config_matches {
+  if [[ -L "${DOCKER_IMAGE_CACHE_PATTERNS_FILE}" ||
+        ! -f "${DOCKER_IMAGE_CACHE_PATTERNS_FILE}" ]]; then
+    return 1
+  fi
+  local saved_patterns
+  saved_patterns=$(<"${DOCKER_IMAGE_CACHE_PATTERNS_FILE}")
+  [[ "${saved_patterns}" == "${DOCKER_IMAGE_PATTERNS_BASE64}" ]]
+}
+
+function clear_docker_image_archive {
+  if [[ -L "${DOCKER_IMAGE_CACHE_DIR}" ]]; then
+    warn "${DOCKER_IMAGE_CACHE_DIR} is a symlink, refusing to clear it"
+    return 0
+  fi
+  [[ -d "${DOCKER_IMAGE_CACHE_DIR}" ]] || return 0
+  if [[ -L "${DOCKER_IMAGE_CACHE_ARCHIVE}" ||
+        -L "${DOCKER_IMAGE_CACHE_PATTERNS_FILE}" ]]; then
+    warn "refusing to clear symlinked Docker image cache files"
+    return 0
+  fi
+  cleanup_docker_image_cache_temps
+  rm -f "${DOCKER_IMAGE_CACHE_ARCHIVE}" "${DOCKER_IMAGE_CACHE_PATTERNS_FILE}"
+}
+
+# Restores only images from an archive created with the current whitelist:
+# docker image load does not import containers, writable layers, volumes,
+# networks, or BuildKit state. A later docker pull can therefore validate mutable
+# tags against their registry without carrying daemon state from the previous VM.
+function restore_tagged_docker_images {
+  configure_docker_image_patterns || return 0
+  prepare_docker_image_cache_dir || return 0
+  [[ -f "${DOCKER_IMAGE_CACHE_ARCHIVE}" &&
+     ! -L "${DOCKER_IMAGE_CACHE_ARCHIVE}" ]] || {
+    log "no saved Docker images found"
+    return 0
+  }
+  if ! docker_image_cache_config_matches; then
+    log "Docker image cache patterns changed or are missing; skipping the previous archive"
+    return 0
+  fi
+  wait_for_docker || return 0
+
+  log "loading tagged Docker images from the warm disk"
+  local load_output loaded_refs=()
+  if load_output=$(timeout "${DOCKER_IMAGE_CACHE_TIMEOUT_SECONDS}" \
+      docker image load --input "${DOCKER_IMAGE_CACHE_ARCHIVE}" 2>&1); then
+    mapfile -t loaded_refs < <(
+      printf '%s\n' "${load_output}" |
+        sed -n 's/^Loaded image: //p'
+    )
+    if [[ "${#loaded_refs[@]}" -gt 0 ]]; then
+      log_docker_image_references "loaded" "${loaded_refs[@]}"
+    else
+      log "Docker reported a successful load without listing image references"
+    fi
+    log "✅ loaded ${#loaded_refs[@]} matching tagged Docker image reference(s)"
+  else
+    warn "could not load the saved Docker images within ${DOCKER_IMAGE_CACHE_TIMEOUT_SECONDS}s"
+  fi
+}
+
+# Saves every matching tagged local image in one archive so shared layers are
+# written only once. The temporary files are renamed only after docker save and
+# gzip both finish; a preemption or full disk therefore leaves the previous
+# archive intact.
+function save_tagged_docker_images {
+  if ! configure_docker_image_patterns; then
+    clear_docker_image_archive
+    return 0
+  fi
+  cleanup_docker_image_cache_temps
+  wait_for_docker || return 0
+  if ! command -v gzip > /dev/null 2>&1; then
+    warn "gzip is not installed, keeping the previous Docker image archive"
+    return 0
+  fi
+
+  local matching
+  if ! matching=$(matching_tagged_docker_images); then
+    warn "could not list Docker images, keeping the previous archive"
+    return 0
+  fi
+
+  local images=()
+  if [[ -z "${matching}" ]]; then
+    log "no tagged Docker images matched the configured cache patterns"
+    clear_docker_image_archive
+    return 0
+  fi
+  mapfile -t images <<< "${matching}"
+
+  prepare_docker_image_cache_dir || return 0
+  cleanup_docker_image_cache_temps
+
+  local tmp="${DOCKER_IMAGE_CACHE_DIR}/.tagged-images.tar.gz.tmp.$$"
+  local patterns_tmp="${DOCKER_IMAGE_CACHE_DIR}/.patterns.base64.tmp.$$"
+  printf '%s\n' "${DOCKER_IMAGE_PATTERNS_BASE64}" > "${patterns_tmp}"
+  chmod 0600 "${patterns_tmp}"
+  log "saving ${#images[@]} matching tagged Docker image reference(s):"
+  log_docker_image_references "saving" "${images[@]}"
+  if timeout "${DOCKER_IMAGE_CACHE_TIMEOUT_SECONDS}" \
+      docker image save "${images[@]}" |
+      timeout "${DOCKER_IMAGE_CACHE_TIMEOUT_SECONDS}" gzip -1 > "${tmp}"; then
+    sync "${tmp}" "${patterns_tmp}" 2>/dev/null || true
+    if [[ -L "${DOCKER_IMAGE_CACHE_ARCHIVE}" ||
+          -L "${DOCKER_IMAGE_CACHE_PATTERNS_FILE}" ]]; then
+      rm -f "${tmp}" "${patterns_tmp}"
+      warn "refusing to replace symlinked Docker image cache files"
+      return 0
+    fi
+
+    # Invalidate the old pairing before publishing either new file. Persist each
+    # directory update in order so a crash can only leave an archive with no
+    # matching config, which restore refuses to load.
+    if ! rm -f "${DOCKER_IMAGE_CACHE_PATTERNS_FILE}"; then
+      rm -f "${tmp}" "${patterns_tmp}"
+      warn "could not invalidate the previous Docker image cache config"
+      return 0
+    fi
+    sync -f "${DOCKER_IMAGE_CACHE_DIR}" 2>/dev/null || true
+    if mv -f "${tmp}" "${DOCKER_IMAGE_CACHE_ARCHIVE}"; then
+      sync -f "${DOCKER_IMAGE_CACHE_DIR}" 2>/dev/null || true
+      if mv -f "${patterns_tmp}" "${DOCKER_IMAGE_CACHE_PATTERNS_FILE}"; then
+        sync -f "${DOCKER_IMAGE_CACHE_DIR}" 2>/dev/null || true
+        log "✅ saved matching tagged Docker images"
+      else
+        rm -f "${DOCKER_IMAGE_CACHE_ARCHIVE}" "${patterns_tmp}"
+        sync -f "${DOCKER_IMAGE_CACHE_DIR}" 2>/dev/null || true
+        warn "could not publish the Docker image cache config; dropped the unpaired archive"
+      fi
+    else
+      rm -f "${tmp}" "${patterns_tmp}"
+      warn "could not publish the Docker image archive"
+    fi
+  else
+    rm -f "${tmp}" "${patterns_tmp}"
+    warn "could not save Docker images within ${DOCKER_IMAGE_CACHE_TIMEOUT_SECONDS}s; keeping the previous archive"
+  fi
+}
+
+function prepare_cache_mount {
+  mkdir -p "${MOUNT_POINT}/bazel" "${MOUNT_POINT}/dvc"
+  restore_tagged_docker_images || true
+}
+
 # Checks a disk out of the pool and mounts it. Runs from the startup script, before
 # the runner registers with GitHub, so the cache is in place before any job step
 # can look for it.
@@ -329,6 +586,7 @@ function acquire {
 
   if mountpoint -q "${MOUNT_POINT}" 2>/dev/null; then
     log "${MOUNT_POINT} is already mounted, nothing to do"
+    prepare_cache_mount
     return 0
   fi
 
@@ -352,7 +610,7 @@ function acquire {
     log "trying to acquire ${disk}"
     if attach_and_mount "${disk}"; then
       log "✅ acquired ${disk} at ${MOUNT_POINT}"
-      mkdir -p "${MOUNT_POINT}/bazel" "${MOUNT_POINT}/dvc"
+      prepare_cache_mount
       return 0
     fi
   done
@@ -367,7 +625,7 @@ function acquire {
   fi
   if attach_and_mount "${disk}"; then
     log "✅ acquired freshly created ${disk} at ${MOUNT_POINT}"
-    mkdir -p "${MOUNT_POINT}/bazel" "${MOUNT_POINT}/dvc"
+    prepare_cache_mount
     return 0
   fi
 
@@ -415,7 +673,9 @@ function prune_cache {
     fi
 
     rc=0
-    timeout "${remaining}" find "${MOUNT_POINT}" -type f -atime +"${days}" -delete \
+    timeout "${remaining}" find "${MOUNT_POINT}" -type f \
+      ! -path "${DOCKER_IMAGE_CACHE_DIR}/*" \
+      -atime +"${days}" -delete \
       2>/dev/null || rc=$?
     usage=$(disk_usage_pct)
     if [[ "${rc}" -eq 124 ]]; then
@@ -428,6 +688,20 @@ function prune_cache {
       break
     fi
   done
+
+  # The archive must be removed as one unit: deleting individual files inside a
+  # Docker save archive would only corrupt it. It is the last eviction candidate
+  # because regenerating it is more expensive than dropping ordinary old entries.
+  if [[ -n "${usage}" && "${usage}" -gt "${PRUNE_THRESHOLD}" &&
+        -d "${DOCKER_IMAGE_CACHE_DIR}" &&
+        ! -L "${DOCKER_IMAGE_CACHE_DIR}" &&
+        -f "${DOCKER_IMAGE_CACHE_ARCHIVE}" &&
+        ! -L "${DOCKER_IMAGE_CACHE_ARCHIVE}" ]]; then
+    log "  still at ${usage}%, dropping the Docker image archive"
+    rm -f "${DOCKER_IMAGE_CACHE_ARCHIVE}" "${DOCKER_IMAGE_CACHE_PATTERNS_FILE}"
+    usage=$(disk_usage_pct)
+    log "  after dropping the Docker image archive: ${usage}%"
+  fi
 }
 
 # Flushes and unmounts the cache. A clean unmount is what lets the next VM skip
@@ -624,8 +898,9 @@ function release {
 
   log "releasing ${disk}"
   if [[ "${preempted}" == "true" ]]; then
-    log "  preempted, skipping the prune so the unmount gets the whole budget"
+    log "  preempted, skipping Docker image save and prune so the unmount gets the whole budget"
   else
+    save_tagged_docker_images || true
     prune_cache || true
   fi
   local unmounted="false"

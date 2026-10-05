@@ -65,6 +65,34 @@ deletes itself. Compute Engine only lets one instance attach a zonal disk
 read-write at a time, so a successful attach *is* the lock; there is no external
 coordination and no lease to expire.
 
+Docker image caching is enabled by specifying a newline-separated whitelist of
+complete `repository:tag` Bash globs:
+
+```yaml
+    cache_docker_image_patterns: |
+      asia-northeast1-docker.pkg.dev/my-project/my-repo/*
+      ghcr.io/my-org/*:ci-*
+```
+
+An empty whitelist disables Docker image caching. Before the runner registers,
+the manager loads the previous archive from
+`docker-image-cache/tagged-images.tar.gz` only when it was created with the same
+whitelist. On a normal release it saves every matching locally tagged image
+(excluding dangling `<none>` images) in a single `docker image save` invocation,
+so images that share content-addressed layers do not duplicate those layers in
+the archive. Reordering or repeating patterns does not invalidate the cache.
+Containers, writable container layers, volumes, networks, and BuildKit cache are
+never exported. Saving is skipped on preemption, and an interrupted or timed-out
+save leaves the previous archive intact. An empty whitelist or a whitelist that
+matches no local tags removes the previous archive on the next normal release.
+The load/save budget is 900 seconds
+(`CACHE_DOCKER_IMAGE_CACHE_TIMEOUT_SECONDS`).
+
+The archive is a cache, not a trust boundary. A workflow with Docker access can
+retag an image before release, so workflows using mutable tags should still pull
+from their registry before running the loaded image. Pools shared across trust
+boundaries should not enable this option.
+
 The pool grows and shrinks on its own. When a VM finds every disk taken it creates
 a new one, seeded from the pool's golden snapshot so it starts warm rather than
 empty. That snapshot is refreshed on release, from a disk that was just cleanly
@@ -95,6 +123,10 @@ what it has to. The whole prune is bounded by a wall clock budget
 (`CACHE_DISK_PRUNE_TIMEOUT_SECONDS`, 300s), and is skipped entirely when the VM is
 being preempted: Compute Engine gives roughly 30 seconds there, which is better
 spent unmounting cleanly than on a prune that cannot finish.
+The Docker image archive is replaced atomically and is excluded from
+file-by-file eviction, which would otherwise corrupt it. If removing ordinary
+old entries still does not bring the disk below the threshold, the archive is
+removed as one final eviction candidate.
 
 **The pool name is the cache key.** Two workflows that share a name share their
 cached data, which is usually what you want — the more jobs share a pool, the
