@@ -146,6 +146,16 @@ inputs:
       are saved together so shared layers are stored only once.
     required: false
     default: ""
+  reservation_preference:
+    description: >-
+      Comma separated list of reservation preferences, tried in order until the VM is created.
+      Each entry must be one of "any" (consume any matching automatic reservation, falling back
+      to on-demand capacity), "none" (never consume a reservation) or "specific:<reservation-name>"
+      (consume that reservation only). Example: "specific:l4-pool,any".
+      A preference is only retried with the next entry when the creation failed because of a lack
+      of capacity; any other failure (invalid machine type, quota, permission, ...) fails immediately.
+    default: "any"
+    required: false
 outputs:
   label:
     description: >-
@@ -200,6 +210,7 @@ runs:
         --cache_disk_idle_ttl_hours="$CACHE_DISK_IDLE_TTL_HOURS"
         --cache_disk_prune_threshold="$CACHE_DISK_PRUNE_THRESHOLD"
         --cache_docker_image_patterns="$CACHE_DOCKER_IMAGE_PATTERNS"
+        --reservation_preference=${{ inputs.reservation_preference }}
       # Passed through the environment rather than interpolated into the command:
       # cache_disk_pool can come from a pull request label, and these values end up
       # in a root-owned file on the runner VM.
